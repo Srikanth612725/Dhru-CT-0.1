@@ -4,7 +4,7 @@ L3 Body Composition Analyzer - Version 2.0
 A research-grade Python module for automated body composition analysis 
 of CT images at the L3 vertebra level.
 
-VERSION 2.0 IMPROVEMENTS:
+VERSION 1.1 IMPROVEMENTS:
 - Added muscle compartment masking to properly separate subcutaneous fat from IMAT
 - IMAT now only includes fat within the muscle compartment (between/within muscles)
 - Subcutaneous fat is identified and excluded from IMAT calculation
