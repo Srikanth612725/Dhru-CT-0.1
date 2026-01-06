@@ -1,4 +1,4 @@
-# Auto-Sarcopenia L3 Analyst (Dhru-CT-0.1)
+# Auto-Sarcopenia L3 Analyst (Dhru-CT-1.1)
 
 A research-grade Python library and Streamlit dashboard for automated body composition analysis of CT images at the L3 vertebra level. This tool replaces manual software like OsiriX by providing automated tissue partitioning and clinical ratio calculations.
 
@@ -31,8 +31,8 @@ This project was developed to democratize medical imaging analysis by providing 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/Dhru-CT-0.1.git
-cd Dhru-CT-0.1
+git clone https://github.com/yourusername/Dhru-CT-1.1.git
+cd Dhru-CT-1.1
 
 # Install dependencies
 pip install -r requirements.txt
