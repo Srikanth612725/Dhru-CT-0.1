@@ -35,7 +35,7 @@ from l3_analyzer import (
 
 # Page configuration
 st.set_page_config(
-    page_title="Auto-Sarcopenia L3 Analyst",
+    page_title="L3 Analyst-Dhru_CT-1.1",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
