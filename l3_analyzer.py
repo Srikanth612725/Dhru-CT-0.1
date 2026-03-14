@@ -259,6 +259,7 @@ class JPEGLoader:
         self.pixel_area_cm2 = (pixel_spacing[0] * pixel_spacing[1]) / 100.0
         self.hu_image: Optional[np.ndarray] = None
         self.body_threshold_hu: Optional[float] = None
+        self.precomputed_body_mask: Optional[np.ndarray] = None
         self._hu_min = hu_min
         self._hu_max = hu_max
 
@@ -268,12 +269,11 @@ class JPEGLoader:
         """Load JPEG file and map pixel values to approximate HU range.
 
         Handles real-world JPEG images including photos of monitor screens:
-        1. Convert to grayscale
-        2. Apply median filter to reduce photo noise
-        3. Use Otsu's thresholding on raw pixels for body/background separation
-        4. Map pixel values to HU range
+        1. Convert to grayscale and denoise
+        2. Compute robust body mask directly from pixel intensities
+        3. Map pixel values to HU range
         """
-        from skimage.filters import threshold_otsu, median
+        from skimage.filters import median
         from skimage.morphology import disk
 
         img = Image.open(self.jpeg_path).convert('L')  # grayscale
@@ -283,18 +283,74 @@ class JPEGLoader:
         raw_uint8 = raw.astype(np.uint8)
         denoised = median(raw_uint8, disk(3))
 
-        # Auto-detect body/background threshold using Otsu on denoised pixels
-        try:
-            otsu_thresh = float(threshold_otsu(denoised))
-        except ValueError:
-            otsu_thresh = 30.0  # safe fallback for uniform images
-
-        # Convert Otsu pixel threshold to HU units
-        self.body_threshold_hu = self._hu_min + (otsu_thresh / 255.0) * (self._hu_max - self._hu_min)
-
         # Linear mapping: pixel 0 -> hu_min, pixel 255 -> hu_max
-        # Use denoised image for cleaner results
         self.hu_image = self._hu_min + (denoised.astype(np.float64) / 255.0) * (self._hu_max - self._hu_min)
+
+        # Compute body mask directly from raw pixels (bypasses HU thresholding)
+        self.precomputed_body_mask = self._compute_body_mask(denoised)
+
+        # Set a body_threshold_hu for compatibility (won't actually be used)
+        self.body_threshold_hu = self._hu_min + 0.15 * (self._hu_max - self._hu_min)
+
+    def _compute_body_mask(self, pixels: np.ndarray) -> np.ndarray:
+        """Compute body mask directly from pixel intensities.
+
+        Uses a dual-threshold + convex hull approach for photos of CT monitors:
+        1. Otsu threshold to find definite bright tissue (muscle/bone seeds)
+        2. Keep largest seed cluster (the body's bright tissue)
+        3. Convex hull of seeds captures the overall body shape
+        4. Low threshold finds all potential body pixels (including fat)
+        5. Expand hull slightly and intersect with low-threshold mask
+        6. Fill holes and morphological cleanup
+
+        This correctly handles photos where >80% of the image is dark
+        monitor background, which defeats percentile-based approaches.
+        """
+        from skimage.filters import threshold_otsu
+        from skimage.morphology import convex_hull_image
+
+        # Step 1: Otsu to find definite bright body tissue (muscle, bone, organs)
+        try:
+            otsu_thresh = threshold_otsu(pixels.astype(np.uint8))
+        except ValueError:
+            otsu_thresh = 50
+
+        seeds = pixels > otsu_thresh
+
+        # Step 2: Keep only the largest bright cluster (the body)
+        labeled = measure.label(seeds)
+        if labeled.max() > 0:
+            regions = measure.regionprops(labeled)
+            largest = max(regions, key=lambda r: r.area)
+            body_seeds = (labeled == largest.label)
+        else:
+            body_seeds = seeds
+
+        # Step 3: Convex hull of seeds - captures overall body outline
+        hull = convex_hull_image(body_seeds)
+
+        # Step 4: Low threshold to find all potential body pixels (fat, tissue)
+        low_thresh = max(otsu_thresh * 0.35, 25)
+        potential_body = pixels > low_thresh
+
+        # Step 5: Expand hull slightly to catch boundary fat, then intersect
+        hull_expanded = morphology.dilation(hull, morphology.disk(15))
+        body_mask = (hull_expanded & potential_body) | hull
+
+        # Step 6: Cleanup
+        body_mask = morphology.closing(body_mask, morphology.disk(3))
+        body_mask = ndimage.binary_fill_holes(body_mask)
+
+        # Keep largest component only
+        labeled2 = measure.label(body_mask)
+        if labeled2.max() > 0:
+            regions2 = measure.regionprops(labeled2)
+            largest2 = max(regions2, key=lambda r: r.area)
+            body_mask = (labeled2 == largest2.label)
+
+        body_mask = ndimage.binary_fill_holes(body_mask)
+
+        return body_mask.astype(bool)
 
     def get_metadata(self) -> Dict[str, Any]:
         """Return placeholder metadata for JPEG images.
@@ -486,89 +542,109 @@ class MuscleCompartmentGenerator:
     
     def _generate_connectivity_based(self, boundary_dilation: int = 5) -> np.ndarray:
         """
-        CONNECTIVITY-BASED approach to separate subcutaneous fat from IMAT.
-        
-        This is the most anatomically accurate method.
-        
+        CONNECTIVITY-BASED approach to separate tissues into compartments.
+
+        Produces three compartments:
+        - Subcutaneous fat (SAT): fat connected to the body outline
+        - Muscle compartment: skeletal muscles at the body wall periphery
+        - Visceral cavity: organs and visceral fat in the center (EXCLUDED)
+
         Strategy:
-        1. Identify the body outline (boundary between body and air)
-        2. Find all fat regions (-190 to -30 HU)
-        3. Label connected components in fat
-        4. Check each fat region - if it connects to/near the body outline,
-           it's subcutaneous fat; otherwise it's IMAT
-        5. Muscle compartment = body mask - subcutaneous fat region
-        
-        This works because:
-        - Subcutaneous fat forms a continuous layer under the skin
-        - IMAT is isolated pockets of fat between muscle fibers
-        - The muscle fascia separates subcutaneous fat from IMAT
+        1. Identify body outline and classify fat as SAT vs interior fat
+        2. Find the SAT layer boundary (inner edge of subcutaneous fat)
+        3. Define muscle compartment as a band inward from the SAT boundary
+        4. IMAT = only SMALL fat pockets within the muscle compartment
+           (large interior fat regions = visceral fat, excluded)
+
+        Clinical Reference:
+            Shen W et al. Am J Clin Nutr 2004
+            Mourtzakis M et al. Appl Physiol Nutr Metab 2008
         """
-        
+
         # Step 1: Get the body outline (outer boundary)
         body_outline = self.body_mask & ~morphology.erosion(
             self.body_mask, morphology.disk(3)
         )
-        
+
         # Dilate the outline to create a "near-boundary" zone
         near_boundary = morphology.dilation(
             body_outline, morphology.disk(boundary_dilation)
         )
-        
+
         # Step 2: Identify all fat tissue within body
         all_fat = (
-            (self.hu_image >= self.thresholds.imat_min) & 
+            (self.hu_image >= self.thresholds.imat_min) &
             (self.hu_image <= self.thresholds.imat_max) &
             self.body_mask
         )
-        
-        # Step 3: Label connected fat regions
+
+        # Step 3: Label connected fat regions and classify SAT vs interior
         labeled_fat = measure.label(all_fat)
-        
-        # Step 4: Classify each fat region
         subcutaneous_mask = np.zeros_like(all_fat)
-        imat_mask = np.zeros_like(all_fat)
-        
+        interior_fat_mask = np.zeros_like(all_fat)
+
         for region in measure.regionprops(labeled_fat):
             region_mask = labeled_fat == region.label
-            
-            # Check if this fat region touches or is near the body boundary
-            # Dilate slightly to check for proximity
             dilated_region = morphology.dilation(region_mask, morphology.disk(3))
-            
+
             if np.any(dilated_region & near_boundary):
-                # This fat is connected to the outer boundary = subcutaneous
                 subcutaneous_mask |= region_mask
             else:
-                # This fat is isolated inside = IMAT
-                imat_mask |= region_mask
-        
-        # Step 5: Muscle compartment = everything except subcutaneous fat region
-        # First, find the extent of subcutaneous fat
-        subcut_region = morphology.dilation(subcutaneous_mask, morphology.disk(2))
-        subcut_region = ndimage.binary_fill_holes(subcut_region)
-        
-        # The muscle compartment is the body minus the outer subcutaneous layer
-        muscle_compartment = self.body_mask & ~(subcut_region & ~self.body_mask)
-        
-        # Alternative: Use erosion from subcutaneous fat to define inner boundary
-        # Find where muscle/bone tissue starts
-        non_fat_tissue = (
-            (self.hu_image >= self.thresholds.lama_min) &
-            self.body_mask &
-            ~subcutaneous_mask
+                interior_fat_mask |= region_mask
+
+        # Step 4: Define muscle compartment as a BAND inward from SAT
+        # The SAT layer forms the outer boundary of the muscle compartment.
+        # Skeletal muscles (rectus abdominis, obliques, psoas, paraspinals)
+        # sit in a band between SAT and the visceral cavity.
+
+        # The SAT zone = subcutaneous fat + a small dilation (no fill_holes,
+        # since fill_holes would fill the entire body interior)
+        sat_zone = morphology.dilation(subcutaneous_mask, morphology.disk(3))
+        sat_zone = sat_zone & self.body_mask
+
+        # Inner region = body minus the SAT zone
+        inner_region = self.body_mask & ~sat_zone
+
+        # Find muscle-density tissue in the inner region
+        muscle_tissue = (
+            (self.hu_image >= self.thresholds.sma_min) &
+            (self.hu_image <= self.thresholds.sma_max) &
+            inner_region
         )
-        
-        # Muscle compartment includes non-fat tissue and any fat not touching boundary
-        muscle_compartment = non_fat_tissue | imat_mask
-        
-        # Fill holes to ensure continuous compartment
+
+        # Also include bone (spine) as structural landmark
+        bone_tissue = (
+            (self.hu_image > self.thresholds.bone_threshold) &
+            inner_region
+        )
+
+        # The muscle compartment = muscle tissue + bone, dilated slightly
+        # to include small fat pockets (IMAT) between muscle groups
+        structural = muscle_tissue | bone_tissue
+        structural = morphology.remove_small_objects(structural, max_size=50)
+
+        # Dilate to connect adjacent muscle groups and enclose IMAT pockets
+        muscle_compartment = morphology.dilation(structural, morphology.disk(5))
+        muscle_compartment = morphology.closing(muscle_compartment, morphology.disk(3))
         muscle_compartment = ndimage.binary_fill_holes(muscle_compartment)
-        muscle_compartment = muscle_compartment & self.body_mask
-        
+        muscle_compartment = muscle_compartment & inner_region
+
+        # Step 5: IMAT = small fat pockets WITHIN the muscle compartment only
+        # Large fat regions inside = visceral fat (excluded from IMAT)
+        imat_mask = np.zeros_like(all_fat)
+        interior_in_mc = interior_fat_mask & muscle_compartment
+
+        labeled_interior = measure.label(interior_in_mc)
+        # IMAT pockets are small (< 2000 pixels); larger = visceral fat
+        max_imat_size = 2000
+        for region in measure.regionprops(labeled_interior):
+            if region.area <= max_imat_size:
+                imat_mask |= (labeled_interior == region.label)
+
         self._muscle_compartment_mask = muscle_compartment.astype(bool)
         self._subcutaneous_fat_mask = subcutaneous_mask.astype(bool)
         self._imat_mask = imat_mask.astype(bool)
-        
+
         return self._muscle_compartment_mask
     
     def _generate_morphological(self, dilation_radius: int = 3) -> np.ndarray:
@@ -1162,17 +1238,19 @@ class L3Analyzer:
                 hu_min=hu_min,
                 hu_max=hu_max
             )
-            # Use auto-detected body threshold from Otsu for JPEG images
-            self.thresholds.body_threshold = int(self.dicom_loader.body_threshold_hu)
+            # For JPEG: use the pre-computed body mask from pixel-level detection
+            # This bypasses BodyMaskGenerator which relies on HU thresholding
+            # that doesn't work well for photos of monitors
+            self._body_mask = self.dicom_loader.precomputed_body_mask
+            self.body_mask_generator = None
         else:
             self.dicom_loader = DICOMLoader(dicom_path)
-
-        # Generate body mask
-        self.body_mask_generator = BodyMaskGenerator(
-            self.dicom_loader.hu_image,
-            self.thresholds.body_threshold
-        )
-        self._body_mask = self.body_mask_generator.generate_mask()
+            # For DICOM: use standard HU-based body mask generation
+            self.body_mask_generator = BodyMaskGenerator(
+                self.dicom_loader.hu_image,
+                self.thresholds.body_threshold
+            )
+            self._body_mask = self.body_mask_generator.generate_mask()
         
         # NEW: Generate muscle compartment mask using connectivity-based method
         self.muscle_compartment_generator = MuscleCompartmentGenerator(
