@@ -544,10 +544,18 @@ def main():
     
     if uploaded_file is not None:
         file_type = _detect_file_type(uploaded_file)
+
+        if file_type == 'jpeg':
+            st.warning(
+                "**JPEG Mode:** HU values are approximate (mapped from pixel "
+                "intensity). Area measurements require correct pixel spacing "
+                "in the sidebar. For clinical-grade results, use DICOM files."
+            )
+
         spinner_msg = "Processing JPEG file..." if file_type == 'jpeg' else "Processing DICOM file..."
         with st.spinner(spinner_msg):
             analyzer = process_uploaded_file(uploaded_file, params)
-        
+
         if analyzer is not None:
             # Run analysis
             with st.spinner("Analyzing tissue composition..."):
@@ -555,11 +563,11 @@ def main():
                     height_m=params['height_m'],
                     weight_kg=params['weight_kg']
                 )
-            
+
             # Store in session state
             st.session_state.analyzer = analyzer
             st.session_state.results = results
-            
+
             # Render all sections
             render_visualization(analyzer, params)
             st.divider()

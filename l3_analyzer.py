@@ -230,10 +230,15 @@ class JPEGLoader:
         Window Center = 40 HU, Window Width = 400 HU
         => pixel 0 maps to -160 HU, pixel 255 maps to +240 HU
 
+    Body isolation uses Otsu's thresholding on raw pixel values to
+    automatically separate the CT body region from the dark background
+    (important for photos of monitor screens).
+
     Attributes:
         hu_image: The image array mapped to approximate Hounsfield Units
         pixel_spacing: Physical spacing between pixels in mm (row, column)
         pixel_area_cm2: Area of a single pixel in cm²
+        body_threshold_hu: Auto-computed HU threshold for body/background separation
     """
 
     def __init__(self, jpeg_path: str,
@@ -253,15 +258,31 @@ class JPEGLoader:
         self.pixel_spacing = pixel_spacing
         self.pixel_area_cm2 = (pixel_spacing[0] * pixel_spacing[1]) / 100.0
         self.hu_image: Optional[np.ndarray] = None
+        self.body_threshold_hu: Optional[float] = None
         self._hu_min = hu_min
         self._hu_max = hu_max
 
         self._load_and_convert()
 
     def _load_and_convert(self) -> None:
-        """Load JPEG file and map pixel values to approximate HU range."""
+        """Load JPEG file and map pixel values to approximate HU range.
+
+        Uses Otsu's thresholding on raw pixel values to auto-detect
+        the body/background boundary, then converts to HU units.
+        """
+        from skimage.filters import threshold_otsu
+
         img = Image.open(self.jpeg_path).convert('L')  # grayscale
         raw = np.array(img, dtype=np.float64)
+
+        # Auto-detect body/background threshold using Otsu on raw pixels
+        try:
+            otsu_thresh = threshold_otsu(raw.astype(np.uint8))
+        except ValueError:
+            otsu_thresh = 30  # safe fallback for uniform images
+
+        # Convert Otsu pixel threshold to HU units
+        self.body_threshold_hu = self._hu_min + (otsu_thresh / 255.0) * (self._hu_max - self._hu_min)
 
         # Linear mapping: pixel 0 -> hu_min, pixel 255 -> hu_max
         self.hu_image = self._hu_min + (raw / 255.0) * (self._hu_max - self._hu_min)
@@ -738,17 +759,28 @@ class TissueSegmenter:
     
     def segment_sma(self) -> np.ndarray:
         """Segment Total Skeletal Muscle Area (-29 to +150 HU).
-        
-        This is calculated first, then NAMA and LAMA are derived from it.
-        
+
+        Uses the muscle compartment mask to restrict SMA to skeletal
+        muscles only, excluding organs and viscera. Also explicitly
+        excludes bone tissue (HU > bone_threshold).
+
+        Per the reference (Mourtzakis et al. 2008), SMA should include
+        only skeletal muscle groups (psoas, paraspinals, abdominal wall).
+
         Returns:
             Binary mask of SMA pixels
         """
         if self._sma_mask is None:
+            # Use muscle compartment mask to exclude organs
+            muscle_region = self.muscle_compartment_generator.muscle_compartment_mask
+
+            # Exclude bone pixels explicitly
+            bone_exclusion = self.hu_image <= self.thresholds.bone_threshold
+
             self._sma_mask = self._create_tissue_mask(
                 self.thresholds.sma_min,
                 self.thresholds.sma_max,
-                self.body_mask,
+                muscle_region & bone_exclusion,
                 min_region_size=50
             )
         return self._sma_mask
@@ -1113,9 +1145,11 @@ class L3Analyzer:
                 hu_min=hu_min,
                 hu_max=hu_max
             )
+            # Use auto-detected body threshold from Otsu for JPEG images
+            self.thresholds.body_threshold = int(self.dicom_loader.body_threshold_hu)
         else:
             self.dicom_loader = DICOMLoader(dicom_path)
-        
+
         # Generate body mask
         self.body_mask_generator = BodyMaskGenerator(
             self.dicom_loader.hu_image,
