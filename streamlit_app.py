@@ -26,11 +26,12 @@ import io
 
 # Import our analysis module
 from l3_analyzer import (
-    L3Analyzer, 
-    HUThresholds, 
-    TissueAreas, 
+    L3Analyzer,
+    HUThresholds,
+    TissueAreas,
     ClinicalRatios,
-    DICOMLoader
+    DICOMLoader,
+    JPEGLoader
 )
 
 # Page configuration
@@ -197,6 +198,47 @@ def render_sidebar():
             help="Opacity of tissue color overlay"
         )
         
+        st.divider()
+
+        # JPEG-specific settings
+        st.header("🖼️ JPEG Settings")
+        st.caption("Only used when uploading JPEG images")
+
+        pixel_spacing_row = st.number_input(
+            "Pixel Spacing - Row (mm)",
+            min_value=0.1,
+            max_value=5.0,
+            value=1.0,
+            step=0.01,
+            format="%.2f",
+            help="Physical pixel spacing in mm (row direction). Check your CT scanner or DICOM viewer for the correct value."
+        )
+        pixel_spacing_col = st.number_input(
+            "Pixel Spacing - Column (mm)",
+            min_value=0.1,
+            max_value=5.0,
+            value=1.0,
+            step=0.01,
+            format="%.2f",
+            help="Physical pixel spacing in mm (column direction)."
+        )
+        hu_min = st.number_input(
+            "HU Min (pixel 0)",
+            min_value=-2000.0,
+            max_value=0.0,
+            value=-160.0,
+            step=10.0,
+            help="Hounsfield Unit value corresponding to the darkest pixel (0). Default assumes abdominal CT window (center=40, width=400)."
+        )
+        hu_max = st.number_input(
+            "HU Max (pixel 255)",
+            min_value=0.0,
+            max_value=3000.0,
+            value=240.0,
+            step=10.0,
+            help="Hounsfield Unit value corresponding to the brightest pixel (255)."
+        )
+
         return {
             'height_m': height_cm / 100.0,
             'weight_kg': weight_kg,
@@ -208,32 +250,45 @@ def render_sidebar():
             'imat_max': imat_max,
             'window_center': window_center,
             'window_width': window_width,
-            'overlay_alpha': overlay_alpha
+            'overlay_alpha': overlay_alpha,
+            'pixel_spacing_row': pixel_spacing_row,
+            'pixel_spacing_col': pixel_spacing_col,
+            'hu_min': hu_min,
+            'hu_max': hu_max
         }
 
 
 def render_file_upload():
     """Render the file upload section."""
-    st.header("📁 Upload DICOM File")
-    
+    st.header("📁 Upload CT Image")
+
     uploaded_file = st.file_uploader(
-        "Choose a DICOM file (.dcm)",
-        type=['dcm', 'dicom'],
+        "Choose a DICOM (.dcm) or JPEG (.jpg/.jpeg) file",
+        type=['dcm', 'dicom', 'jpg', 'jpeg'],
         help="Upload a single CT slice at the L3 vertebra level"
     )
-    
+
     return uploaded_file
 
 
-def process_dicom(uploaded_file, params: dict) -> Optional[L3Analyzer]:
-    """Process the uploaded DICOM file."""
+def _detect_file_type(uploaded_file) -> str:
+    """Detect whether the uploaded file is DICOM or JPEG."""
+    name = uploaded_file.name.lower()
+    if name.endswith(('.jpg', '.jpeg')):
+        return 'jpeg'
+    return 'dicom'
+
+
+def process_uploaded_file(uploaded_file, params: dict) -> Optional[L3Analyzer]:
+    """Process the uploaded DICOM or JPEG file."""
+    file_type = _detect_file_type(uploaded_file)
+    suffix = '.jpg' if file_type == 'jpeg' else '.dcm'
+
     try:
-        # Save uploaded file to temporary location
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.dcm') as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_path = tmp_file.name
-        
-        # Create custom thresholds
+
         thresholds = HUThresholds(
             nama_min=params['nama_min'],
             nama_max=params['nama_max'],
@@ -242,17 +297,27 @@ def process_dicom(uploaded_file, params: dict) -> Optional[L3Analyzer]:
             imat_min=params['imat_min'],
             imat_max=params['imat_max']
         )
-        
-        # Initialize analyzer
-        analyzer = L3Analyzer(tmp_path, thresholds)
-        
-        # Clean up temp file
+
+        if file_type == 'jpeg':
+            analyzer = L3Analyzer(
+                tmp_path,
+                thresholds,
+                file_type='jpeg',
+                pixel_spacing=(
+                    params.get('pixel_spacing_row', 1.0),
+                    params.get('pixel_spacing_col', 1.0)
+                ),
+                hu_min=params.get('hu_min', -160.0),
+                hu_max=params.get('hu_max', 240.0)
+            )
+        else:
+            analyzer = L3Analyzer(tmp_path, thresholds)
+
         os.unlink(tmp_path)
-        
         return analyzer
-        
+
     except Exception as e:
-        st.error(f"Error loading DICOM file: {str(e)}")
+        st.error(f"Error loading {file_type.upper()} file: {str(e)}")
         return None
 
 
@@ -478,8 +543,10 @@ def main():
     uploaded_file = render_file_upload()
     
     if uploaded_file is not None:
-        with st.spinner("Processing DICOM file..."):
-            analyzer = process_dicom(uploaded_file, params)
+        file_type = _detect_file_type(uploaded_file)
+        spinner_msg = "Processing JPEG file..." if file_type == 'jpeg' else "Processing DICOM file..."
+        with st.spinner(spinner_msg):
+            analyzer = process_uploaded_file(uploaded_file, params)
         
         if analyzer is not None:
             # Run analysis
@@ -501,7 +568,7 @@ def main():
             render_export(analyzer, results)
     else:
         # Show placeholder
-        st.info("👆 Upload a DICOM file to begin analysis")
+        st.info("👆 Upload a DICOM or JPEG file to begin analysis")
         
         # Show demo info
         render_info()

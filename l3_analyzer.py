@@ -23,6 +23,7 @@ License: BSD 3-Clause
 import numpy as np
 import pydicom
 from pydicom.pixel_data_handlers.util import apply_modality_lut
+from PIL import Image
 from skimage import morphology, measure
 from skimage.segmentation import clear_border
 from scipy import ndimage
@@ -215,6 +216,75 @@ class DICOMLoader:
             'columns': ds.Columns,
             'rescale_slope': getattr(ds, 'RescaleSlope', 1.0),
             'rescale_intercept': getattr(ds, 'RescaleIntercept', 0.0),
+        }
+
+
+class JPEGLoader:
+    """Handles JPEG image loading with approximate HU mapping.
+
+    Since JPEG images do not contain DICOM metadata, this loader maps
+    grayscale pixel values (0-255) to an approximate Hounsfield Unit range
+    based on user-provided window settings.
+
+    Default mapping assumes a standard abdominal CT window:
+        Window Center = 40 HU, Window Width = 400 HU
+        => pixel 0 maps to -160 HU, pixel 255 maps to +240 HU
+
+    Attributes:
+        hu_image: The image array mapped to approximate Hounsfield Units
+        pixel_spacing: Physical spacing between pixels in mm (row, column)
+        pixel_area_cm2: Area of a single pixel in cm²
+    """
+
+    def __init__(self, jpeg_path: str,
+                 pixel_spacing: Tuple[float, float] = (1.0, 1.0),
+                 hu_min: float = -160.0,
+                 hu_max: float = 240.0):
+        """Initialize the JPEG loader.
+
+        Args:
+            jpeg_path: Path to the JPEG image file
+            pixel_spacing: Physical pixel spacing in mm (row, col).
+                           Default is 1.0mm x 1.0mm.
+            hu_min: HU value corresponding to pixel value 0
+            hu_max: HU value corresponding to pixel value 255
+        """
+        self.jpeg_path = jpeg_path
+        self.pixel_spacing = pixel_spacing
+        self.pixel_area_cm2 = (pixel_spacing[0] * pixel_spacing[1]) / 100.0
+        self.hu_image: Optional[np.ndarray] = None
+        self._hu_min = hu_min
+        self._hu_max = hu_max
+
+        self._load_and_convert()
+
+    def _load_and_convert(self) -> None:
+        """Load JPEG file and map pixel values to approximate HU range."""
+        img = Image.open(self.jpeg_path).convert('L')  # grayscale
+        raw = np.array(img, dtype=np.float64)
+
+        # Linear mapping: pixel 0 -> hu_min, pixel 255 -> hu_max
+        self.hu_image = self._hu_min + (raw / 255.0) * (self._hu_max - self._hu_min)
+
+    def get_metadata(self) -> Dict[str, Any]:
+        """Return placeholder metadata for JPEG images.
+
+        Returns:
+            Dictionary containing available metadata
+        """
+        h, w = self.hu_image.shape
+        return {
+            'patient_id': 'N/A (JPEG)',
+            'patient_name': 'N/A (JPEG)',
+            'study_date': 'N/A',
+            'series_description': 'JPEG Import',
+            'slice_location': None,
+            'slice_thickness': None,
+            'pixel_spacing': self.pixel_spacing,
+            'rows': h,
+            'columns': w,
+            'rescale_slope': 1.0,
+            'rescale_intercept': 0.0,
         }
 
 
@@ -1016,19 +1086,35 @@ class L3Analyzer:
         thresholds: Current HU thresholds
     """
     
-    def __init__(self, 
+    def __init__(self,
                  dicom_path: str,
-                 thresholds: Optional[HUThresholds] = None):
+                 thresholds: Optional[HUThresholds] = None,
+                 file_type: str = 'dicom',
+                 pixel_spacing: Tuple[float, float] = (1.0, 1.0),
+                 hu_min: float = -160.0,
+                 hu_max: float = 240.0):
         """Initialize the L3 analyzer.
-        
+
         Args:
-            dicom_path: Path to the DICOM file
+            dicom_path: Path to the image file (DICOM or JPEG)
             thresholds: Custom HU thresholds (uses validated defaults if None)
+            file_type: 'dicom' or 'jpeg' to select the loader
+            pixel_spacing: Pixel spacing in mm (only used for JPEG)
+            hu_min: HU value for pixel 0 (only used for JPEG)
+            hu_max: HU value for pixel 255 (only used for JPEG)
         """
         self.thresholds = thresholds or HUThresholds()
-        
-        # Load DICOM
-        self.dicom_loader = DICOMLoader(dicom_path)
+
+        # Load image based on file type
+        if file_type == 'jpeg':
+            self.dicom_loader = JPEGLoader(
+                dicom_path,
+                pixel_spacing=pixel_spacing,
+                hu_min=hu_min,
+                hu_max=hu_max
+            )
+        else:
+            self.dicom_loader = DICOMLoader(dicom_path)
         
         # Generate body mask
         self.body_mask_generator = BodyMaskGenerator(

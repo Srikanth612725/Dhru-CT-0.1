@@ -20,6 +20,6 @@ streamlit>=1.28.0
 # Data Handling
 pandas>=2.0.0
 
-# Optional: For enhanced DICOM handling
-# pillow>=10.0.0
+# JPEG Image Support
+Pillow>=10.0.0
 # gdcm  # For compressed DICOM files
