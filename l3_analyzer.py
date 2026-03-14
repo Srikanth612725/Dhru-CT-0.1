@@ -592,50 +592,61 @@ class MuscleCompartmentGenerator:
             else:
                 interior_fat_mask |= region_mask
 
-        # Step 4: Define muscle compartment as a BAND inward from SAT
-        # The SAT layer forms the outer boundary of the muscle compartment.
-        # Skeletal muscles (rectus abdominis, obliques, psoas, paraspinals)
-        # sit in a band between SAT and the visceral cavity.
+        # Step 4: Define muscle compartment as a BAND near the body wall
+        #
+        # At L3 level, skeletal muscles form a peripheral ring:
+        # - Abdominal wall: rectus abdominis, obliques, transverse abdominis
+        # - Posterior: psoas, erector spinae, quadratus lumborum
+        #
+        # These muscles sit between the SAT (outer) and visceral cavity (inner).
+        # Typical muscle layer depth is 2-4 cm from the SAT boundary.
+        # We use a distance transform to create this band.
 
-        # The SAT zone = subcutaneous fat + a small dilation (no fill_holes,
-        # since fill_holes would fill the entire body interior)
+        # SAT zone (subcutaneous fat + small buffer)
         sat_zone = morphology.dilation(subcutaneous_mask, morphology.disk(3))
         sat_zone = sat_zone & self.body_mask
 
-        # Inner region = body minus the SAT zone
+        # Inner region = body minus SAT zone
         inner_region = self.body_mask & ~sat_zone
 
-        # Find muscle-density tissue in the inner region
+        # Distance transform: distance of each inner pixel from the SAT boundary
+        # Pixels close to SAT = muscle layer; pixels far from SAT = visceral cavity
+        from scipy.ndimage import distance_transform_edt
+        dist_from_sat = distance_transform_edt(inner_region)
+
+        # Muscle band depth: scale with image size for robustness
+        # Typical abdominal wall is ~2-4 cm. With 1mm pixel spacing = 20-40 pixels.
+        # Use 15% of the body's minor axis as adaptive depth.
+        body_rows = np.any(self.body_mask, axis=1)
+        body_height = np.sum(body_rows)
+        band_depth = max(30, int(body_height * 0.20))
+
+        # The muscle band = inner region pixels within band_depth of SAT
+        muscle_band = inner_region & (dist_from_sat <= band_depth)
+
+        # Only include muscle-density and bone tissue in the compartment
         muscle_tissue = (
             (self.hu_image >= self.thresholds.sma_min) &
             (self.hu_image <= self.thresholds.sma_max) &
-            inner_region
+            muscle_band
         )
-
-        # Also include bone (spine) as structural landmark
         bone_tissue = (
             (self.hu_image > self.thresholds.bone_threshold) &
-            inner_region
+            muscle_band
         )
 
-        # The muscle compartment = muscle tissue + bone, dilated slightly
-        # to include small fat pockets (IMAT) between muscle groups
         structural = muscle_tissue | bone_tissue
         structural = morphology.remove_small_objects(structural, max_size=50)
 
-        # Dilate to connect adjacent muscle groups and enclose IMAT pockets
-        muscle_compartment = morphology.dilation(structural, morphology.disk(5))
-        muscle_compartment = morphology.closing(muscle_compartment, morphology.disk(3))
-        muscle_compartment = ndimage.binary_fill_holes(muscle_compartment)
-        muscle_compartment = muscle_compartment & inner_region
+        # Dilate slightly to include small IMAT pockets between muscle groups
+        muscle_compartment = morphology.dilation(structural, morphology.disk(3))
+        muscle_compartment = muscle_compartment & muscle_band
 
-        # Step 5: IMAT = small fat pockets WITHIN the muscle compartment only
-        # Large fat regions inside = visceral fat (excluded from IMAT)
+        # Step 5: IMAT = small fat pockets WITHIN the muscle band only
         imat_mask = np.zeros_like(all_fat)
-        interior_in_mc = interior_fat_mask & muscle_compartment
+        interior_in_band = interior_fat_mask & muscle_band
 
-        labeled_interior = measure.label(interior_in_mc)
-        # IMAT pockets are small (< 2000 pixels); larger = visceral fat
+        labeled_interior = measure.label(interior_in_band)
         max_imat_size = 2000
         for region in measure.regionprops(labeled_interior):
             if region.area <= max_imat_size:
