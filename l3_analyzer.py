@@ -598,31 +598,43 @@ class MuscleCompartmentGenerator:
         # - Abdominal wall: rectus abdominis, obliques, transverse abdominis
         # - Posterior: psoas, erector spinae, quadratus lumborum
         #
-        # These muscles sit between the SAT (outer) and visceral cavity (inner).
-        # Typical muscle layer depth is 2-4 cm from the SAT boundary.
-        # We use a distance transform to create this band.
+        # These sit BETWEEN the SAT (outer) and visceral cavity (inner).
+        # We use distance from the BODY BOUNDARY (not SAT) to define zones,
+        # because HU-based SAT detection often fails for JPEG photos.
+        #
+        # Geometry (from body boundary inward):
+        #   [0, sat_depth)       = SAT zone (subcutaneous fat)
+        #   [sat_depth, muscle_end) = Muscle band (skeletal muscles + IMAT)
+        #   [muscle_end, ...)    = Visceral cavity (organs, excluded)
 
-        # SAT zone (subcutaneous fat + small buffer)
-        sat_zone = morphology.dilation(subcutaneous_mask, morphology.disk(3))
-        sat_zone = sat_zone & self.body_mask
-
-        # Inner region = body minus SAT zone
-        inner_region = self.body_mask & ~sat_zone
-
-        # Distance transform: distance of each inner pixel from the SAT boundary
-        # Pixels close to SAT = muscle layer; pixels far from SAT = visceral cavity
         from scipy.ndimage import distance_transform_edt
-        dist_from_sat = distance_transform_edt(inner_region)
 
-        # Muscle band depth: scale with image size for robustness
-        # Typical abdominal wall is ~2-4 cm. With 1mm pixel spacing = 20-40 pixels.
-        # Use 15% of the body's minor axis as adaptive depth.
+        # Distance from body boundary for every pixel inside the body
+        dist_from_boundary = distance_transform_edt(self.body_mask)
+
+        # Adaptive zone depths based on body size
         body_rows = np.any(self.body_mask, axis=1)
         body_height = np.sum(body_rows)
-        band_depth = max(30, int(body_height * 0.20))
+        body_cols = np.any(self.body_mask, axis=0)
+        body_width = np.sum(body_cols)
+        body_minor = min(body_height, body_width)
 
-        # The muscle band = inner region pixels within band_depth of SAT
-        muscle_band = inner_region & (dist_from_sat <= band_depth)
+        # SAT zone: outer ~8% of body (typically 1-2 cm)
+        sat_depth = max(15, int(body_minor * 0.08))
+        # Muscle band: next ~12% of body (typically 2-4 cm)
+        muscle_depth = max(20, int(body_minor * 0.12))
+        muscle_end = sat_depth + muscle_depth
+
+        # Geometric SAT zone (always applied, regardless of HU detection)
+        geometric_sat = self.body_mask & (dist_from_boundary <= sat_depth)
+        # Merge with HU-detected SAT
+        subcutaneous_mask = subcutaneous_mask | geometric_sat
+
+        # Muscle band = between SAT zone and visceral cavity
+        muscle_band = self.body_mask & (
+            (dist_from_boundary > sat_depth) &
+            (dist_from_boundary <= muscle_end)
+        )
 
         # Only include muscle-density and bone tissue in the compartment
         muscle_tissue = (
