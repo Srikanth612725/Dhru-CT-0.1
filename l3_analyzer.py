@@ -267,25 +267,34 @@ class JPEGLoader:
     def _load_and_convert(self) -> None:
         """Load JPEG file and map pixel values to approximate HU range.
 
-        Uses Otsu's thresholding on raw pixel values to auto-detect
-        the body/background boundary, then converts to HU units.
+        Handles real-world JPEG images including photos of monitor screens:
+        1. Convert to grayscale
+        2. Apply median filter to reduce photo noise
+        3. Use Otsu's thresholding on raw pixels for body/background separation
+        4. Map pixel values to HU range
         """
-        from skimage.filters import threshold_otsu
+        from skimage.filters import threshold_otsu, median
+        from skimage.morphology import disk
 
         img = Image.open(self.jpeg_path).convert('L')  # grayscale
         raw = np.array(img, dtype=np.float64)
 
-        # Auto-detect body/background threshold using Otsu on raw pixels
+        # Denoise with median filter (handles photo noise from monitor captures)
+        raw_uint8 = raw.astype(np.uint8)
+        denoised = median(raw_uint8, disk(3))
+
+        # Auto-detect body/background threshold using Otsu on denoised pixels
         try:
-            otsu_thresh = threshold_otsu(raw.astype(np.uint8))
+            otsu_thresh = float(threshold_otsu(denoised))
         except ValueError:
-            otsu_thresh = 30  # safe fallback for uniform images
+            otsu_thresh = 30.0  # safe fallback for uniform images
 
         # Convert Otsu pixel threshold to HU units
         self.body_threshold_hu = self._hu_min + (otsu_thresh / 255.0) * (self._hu_max - self._hu_min)
 
         # Linear mapping: pixel 0 -> hu_min, pixel 255 -> hu_max
-        self.hu_image = self._hu_min + (raw / 255.0) * (self._hu_max - self._hu_min)
+        # Use denoised image for cleaner results
+        self.hu_image = self._hu_min + (denoised.astype(np.float64) / 255.0) * (self._hu_max - self._hu_min)
 
     def get_metadata(self) -> Dict[str, Any]:
         """Return placeholder metadata for JPEG images.
@@ -362,7 +371,7 @@ class BodyMaskGenerator:
         # Step 2: Morphological closing to fill small holes and gaps
         # This connects nearby regions and smooths the boundary
         selem = morphology.disk(closing_radius)
-        closed_mask = morphology.binary_closing(initial_mask, selem)
+        closed_mask = morphology.closing(initial_mask, selem)
         
         # Step 3: Fill holes in the body mask
         # Important for including air-filled structures inside the body
@@ -370,8 +379,8 @@ class BodyMaskGenerator:
         
         # Step 4: Remove small objects (noise, artifacts)
         cleaned_mask = morphology.remove_small_objects(
-            filled_mask, 
-            min_size=min_body_size
+            filled_mask,
+            max_size=min_body_size
         )
         
         # Step 5: Connected Component Analysis - keep largest component
@@ -394,8 +403,8 @@ class BodyMaskGenerator:
         
         # Step 7: Final morphological cleanup
         # Apply erosion followed by dilation to smooth edges
-        body_mask = morphology.binary_opening(body_mask, morphology.disk(2))
-        body_mask = morphology.binary_closing(body_mask, morphology.disk(2))
+        body_mask = morphology.opening(body_mask, morphology.disk(2))
+        body_mask = morphology.closing(body_mask, morphology.disk(2))
         
         self._body_mask = body_mask.astype(bool)
         return self._body_mask
@@ -496,12 +505,12 @@ class MuscleCompartmentGenerator:
         """
         
         # Step 1: Get the body outline (outer boundary)
-        body_outline = self.body_mask & ~morphology.binary_erosion(
+        body_outline = self.body_mask & ~morphology.erosion(
             self.body_mask, morphology.disk(3)
         )
         
         # Dilate the outline to create a "near-boundary" zone
-        near_boundary = morphology.binary_dilation(
+        near_boundary = morphology.dilation(
             body_outline, morphology.disk(boundary_dilation)
         )
         
@@ -524,7 +533,7 @@ class MuscleCompartmentGenerator:
             
             # Check if this fat region touches or is near the body boundary
             # Dilate slightly to check for proximity
-            dilated_region = morphology.binary_dilation(region_mask, morphology.disk(3))
+            dilated_region = morphology.dilation(region_mask, morphology.disk(3))
             
             if np.any(dilated_region & near_boundary):
                 # This fat is connected to the outer boundary = subcutaneous
@@ -535,7 +544,7 @@ class MuscleCompartmentGenerator:
         
         # Step 5: Muscle compartment = everything except subcutaneous fat region
         # First, find the extent of subcutaneous fat
-        subcut_region = morphology.binary_dilation(subcutaneous_mask, morphology.disk(2))
+        subcut_region = morphology.dilation(subcutaneous_mask, morphology.disk(2))
         subcut_region = ndimage.binary_fill_holes(subcut_region)
         
         # The muscle compartment is the body minus the outer subcutaneous layer
@@ -597,11 +606,11 @@ class MuscleCompartmentGenerator:
         
         # Step 4: Clean up small isolated regions
         structural_tissue = morphology.remove_small_objects(
-            structural_tissue, min_size=100
+            structural_tissue, max_size=100
         )
         
         # Step 5: Dilate to connect nearby muscle groups
-        dilated_structure = morphology.binary_dilation(
+        dilated_structure = morphology.dilation(
             structural_tissue, 
             morphology.disk(dilation_radius)
         )
@@ -613,7 +622,7 @@ class MuscleCompartmentGenerator:
         muscle_compartment = ndimage.binary_fill_holes(dilated_structure)
         
         # Step 8: Apply closing to smooth the boundary
-        muscle_compartment = morphology.binary_closing(
+        muscle_compartment = morphology.closing(
             muscle_compartment, 
             morphology.disk(2)
         )
@@ -753,7 +762,7 @@ class TissueSegmenter:
         
         # Remove small isolated regions (noise)
         if min_region_size > 0:
-            mask = morphology.remove_small_objects(mask, min_size=min_region_size)
+            mask = morphology.remove_small_objects(mask, max_size=min_region_size)
         
         return mask.astype(bool)
     
@@ -974,20 +983,24 @@ class Visualizer:
         colors: VisualizationColors object
     """
     
-    def __init__(self, 
-                 hu_image: np.ndarray, 
+    def __init__(self,
+                 hu_image: np.ndarray,
                  masks: Dict[str, np.ndarray],
-                 colors: Optional[VisualizationColors] = None):
+                 colors: Optional[VisualizationColors] = None,
+                 body_mask: Optional[np.ndarray] = None):
         """Initialize the visualizer.
-        
+
         Args:
             hu_image: 2D numpy array of HU values
             masks: Dictionary of tissue masks
             colors: Custom colors (uses defaults if None)
+            body_mask: Binary mask of the body region. Pixels outside
+                       this mask are forced to black in the overlay.
         """
         self.hu_image = hu_image
         self.masks = masks
         self.colors = colors or VisualizationColors()
+        self.body_mask = body_mask
     
     def generate_overlay(self,
                          window_center: int = 40,
@@ -1046,7 +1059,11 @@ class Visualizer:
                 rgb[self.masks['imat']] = self.colors.imat
             if show_sat and 'sat' in self.masks:
                 rgb[self.masks['sat']] = self.colors.sat
-        
+
+        # Enforce body mask: force all non-body pixels to black
+        if self.body_mask is not None:
+            rgb[~self.body_mask] = 0.0
+
         return rgb
     
     def save_overlay(self, 
@@ -1217,10 +1234,11 @@ class L3Analyzer:
         # Calculate BMI
         bmi = weight_kg / (height_m ** 2)
         
-        # Initialize visualizer
+        # Initialize visualizer with body mask to enforce background = black
         self._visualizer = Visualizer(
             self.dicom_loader.hu_image,
-            self._masks
+            self._masks,
+            body_mask=self._body_mask
         )
         
         return {
