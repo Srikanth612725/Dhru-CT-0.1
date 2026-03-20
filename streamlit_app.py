@@ -516,13 +516,24 @@ def render_export(analyzer: L3Analyzer, results: dict):
 # Volume analysis helpers
 # ---------------------------------------------------------------------------
 
+def _is_dicom_file(filepath: str) -> bool:
+    """Check if a file is a valid DICOM file by reading its header."""
+    try:
+        import pydicom
+        pydicom.dcmread(filepath, stop_before_pixels=True)
+        return True
+    except Exception:
+        return False
+
+
 def _extract_dicom_files_from_upload(uploaded_files) -> List[str]:
     """Save uploaded DICOM files to a temp directory and return paths.
 
-    Handles both raw .dcm uploads and .zip archives.
+    Handles .dcm files, extensionless DICOM files (IM0, IM1, ...),
+    and .zip archives containing any of the above.
     """
     tmp_dir = tempfile.mkdtemp(prefix="dicom_series_")
-    paths: List[str] = []
+    candidate_paths: List[str] = []
 
     for uf in uploaded_files:
         name_lower = uf.name.lower()
@@ -535,18 +546,19 @@ def _extract_dicom_files_from_upload(uploaded_files) -> List[str]:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 zf.extractall(tmp_dir)
             os.unlink(zip_path)
-            # Walk extracted tree for DICOM files
+            # Walk extracted tree — include all non-directory files
             for root, _dirs, files in os.walk(tmp_dir):
                 for fname in files:
-                    fl = fname.lower()
-                    if fl.endswith(('.dcm', '.dicom')) or not os.path.splitext(fl)[1]:
-                        paths.append(os.path.join(root, fname))
+                    if not fname.startswith('.'):
+                        candidate_paths.append(os.path.join(root, fname))
         else:
             dest = os.path.join(tmp_dir, uf.name)
             with open(dest, 'wb') as f:
                 f.write(uf.getvalue())
-            paths.append(dest)
+            candidate_paths.append(dest)
 
+    # Filter to actual DICOM files (handles extensionless files like IM0, IM1, ...)
+    paths = [p for p in candidate_paths if _is_dicom_file(p)]
     return paths
 
 
@@ -554,15 +566,15 @@ def render_volume_upload():
     """Render the volume upload section."""
     st.header("📁 Upload DICOM Series")
     st.caption(
-        "Upload all DICOM files from a single CT scan. You can upload "
-        "individual .dcm files or a .zip archive containing the series."
+        "Upload all DICOM files from a single CT scan. Accepts .dcm files, "
+        "extensionless DICOM files (IM0, IM1, ...), or a .zip archive."
     )
 
     uploaded_files = st.file_uploader(
         "Choose DICOM files or a ZIP archive",
-        type=['dcm', 'dicom', 'zip'],
+        type=None,  # Accept any file type (scanners often export without extensions)
         accept_multiple_files=True,
-        help="Upload all slices from a CT series (any number of files)",
+        help="Upload all slices from a CT series — .dcm, extensionless (IM0, IM1, ...), or .zip",
         key="volume_uploader",
     )
 
