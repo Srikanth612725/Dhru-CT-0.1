@@ -516,7 +516,9 @@ class MuscleCompartmentGenerator:
     
     def generate_muscle_compartment(self,
                                     boundary_dilation: int = 5,
-                                    method: str = 'connectivity') -> np.ndarray:
+                                    method: str = 'connectivity',
+                                    sat_fraction: float = 0.08,
+                                    muscle_fraction: float = 0.12) -> np.ndarray:
         """
         Generate a mask defining the muscle compartment boundary.
         
@@ -534,13 +536,17 @@ class MuscleCompartmentGenerator:
         """
         
         if method == 'connectivity':
-            return self._generate_connectivity_based(boundary_dilation)
+            return self._generate_connectivity_based(
+                boundary_dilation, sat_fraction, muscle_fraction
+            )
         elif method == 'morphological':
             return self._generate_morphological()
         else:
             raise ValueError(f"Unknown method: {method}")
     
-    def _generate_connectivity_based(self, boundary_dilation: int = 5) -> np.ndarray:
+    def _generate_connectivity_based(self, boundary_dilation: int = 5,
+                                      sat_fraction: float = 0.08,
+                                      muscle_fraction: float = 0.12) -> np.ndarray:
         """
         CONNECTIVITY-BASED approach to separate tissues into compartments.
 
@@ -619,10 +625,10 @@ class MuscleCompartmentGenerator:
         body_width = np.sum(body_cols)
         body_minor = min(body_height, body_width)
 
-        # SAT zone: outer ~8% of body (typically 1-2 cm)
-        sat_depth = max(15, int(body_minor * 0.08))
-        # Muscle band: next ~12% of body (typically 2-4 cm)
-        muscle_depth = max(20, int(body_minor * 0.12))
+        # SAT zone: outer fraction of body (default 8%, ~1-2 cm at L3)
+        sat_depth = max(15, int(body_minor * sat_fraction))
+        # Muscle band: next fraction of body (default 12%, ~2-4 cm at L3)
+        muscle_depth = max(20, int(body_minor * muscle_fraction))
         muscle_end = sat_depth + muscle_depth
 
         # Geometric SAT zone (always applied, regardless of HU detection)

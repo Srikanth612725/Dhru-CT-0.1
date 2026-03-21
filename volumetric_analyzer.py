@@ -177,6 +177,8 @@ def _analyze_single_slice(
     hu_image: np.ndarray,
     thresholds: HUThresholds,
     pixel_area_cm2: float,
+    sat_fraction: float = 0.08,
+    muscle_fraction: float = 0.12,
 ) -> TissueAreas:
     """Run the full segmentation pipeline on one slice and return areas.
 
@@ -187,7 +189,11 @@ def _analyze_single_slice(
     body_mask = bmg.generate_mask()
 
     mcg = MuscleCompartmentGenerator(hu_image, body_mask, thresholds)
-    mcg.generate_muscle_compartment(method='connectivity')
+    mcg.generate_muscle_compartment(
+        method='connectivity',
+        sat_fraction=sat_fraction,
+        muscle_fraction=muscle_fraction,
+    )
 
     seg = TissueSegmenter(hu_image, body_mask, mcg, thresholds)
     masks = seg.get_all_masks()
@@ -202,6 +208,13 @@ class VolumetricAnalyzer:
     MEMORY-EFFICIENT: processes one slice at a time, discards pixel data,
     stores only the numeric results (TissueAreas) per slice.
     """
+
+    # Wider muscle band for multi-level volumetric analysis.
+    # At L3 the abdominal wall muscles are thin (8% SAT, 12% muscle band).
+    # At other levels (pelvis, chest) muscles extend deeper.
+    # These widened defaults capture psoas, gluteals, paraspinals, pectorals.
+    VOL_SAT_FRACTION = 0.06    # Slightly thinner SAT zone
+    VOL_MUSCLE_FRACTION = 0.25  # Much wider muscle band (captures deeper muscles)
 
     def __init__(
         self,
@@ -236,8 +249,12 @@ class VolumetricAnalyzer:
             # Load pixel data for this slice only
             hu_image, slice_meta = self.series.load_slice_hu(i)
 
-            # Analyze — returns only areas (numbers)
-            areas = _analyze_single_slice(hu_image, self.thresholds, pixel_area_cm2)
+            # Analyze with wider muscle band for multi-level coverage
+            areas = _analyze_single_slice(
+                hu_image, self.thresholds, pixel_area_cm2,
+                sat_fraction=self.VOL_SAT_FRACTION,
+                muscle_fraction=self.VOL_MUSCLE_FRACTION,
+            )
 
             self.slice_results.append(SliceResult(
                 slice_index=i,
@@ -309,7 +326,11 @@ class VolumetricAnalyzer:
         body_mask = bmg.generate_mask()
 
         mcg = MuscleCompartmentGenerator(hu_image, body_mask, self.thresholds)
-        mcg.generate_muscle_compartment(method='connectivity')
+        mcg.generate_muscle_compartment(
+            method='connectivity',
+            sat_fraction=self.VOL_SAT_FRACTION,
+            muscle_fraction=self.VOL_MUSCLE_FRACTION,
+        )
 
         seg = TissueSegmenter(hu_image, body_mask, mcg, self.thresholds)
         masks = seg.get_all_masks()

@@ -669,6 +669,31 @@ def render_volume_results(results: dict):
         status = "🟢" if nv > 0.5 else "🟡" if nv > 0.3 else "🔴"
         st.metric(f"NAMA/TAMA {status}", f"{nv:.3f}", help="Volumetric muscle quality")
 
+    # Per-slice validation summary
+    per_slice = results.get('per_slice', [])
+    if per_slice:
+        sma_values = [s.areas.sma for s in per_slice]
+        peak_sma = max(sma_values)
+        peak_idx = sma_values.index(peak_sma)
+        mean_sma = sum(sma_values) / len(sma_values)
+
+        st.divider()
+        with st.expander("🔍 Per-Slice Validation (compare with literature)"):
+            st.markdown(
+                "**Expected L3 single-slice SMA** (Mourtzakis 2008): "
+                "Males 130-190 cm², Females 80-140 cm²"
+            )
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Peak SMA Slice", f"{peak_sma:.1f} cm²",
+                          help=f"Slice #{peak_idx} — likely near L3")
+            with c2:
+                st.metric("Mean SMA/Slice", f"{mean_sma:.1f} cm²")
+            with c3:
+                st.metric("NAMA/TAMA @ Peak",
+                          f"{per_slice[peak_idx].areas.nama / per_slice[peak_idx].areas.sma:.3f}"
+                          if per_slice[peak_idx].areas.sma > 0 else "N/A")
+
 
 def render_slice_browser(vol_analyzer: VolumetricAnalyzer, params: dict):
     """Render an interactive slice browser."""
