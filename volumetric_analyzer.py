@@ -4,18 +4,18 @@ Volumetric (3D) Body Composition Analyzer
 Processes an entire DICOM series (any number of slices) to compute
 tissue VOLUMES (cm³) instead of single-slice areas (cm²).
 
-Pipeline:
-1. Load all DICOM files in a series
-2. Sort by SliceLocation / InstanceNumber
-3. Run per-slice tissue segmentation using the existing L3Analyzer pipeline
-4. Sum slice areas × slice thickness → tissue volumes in cm³
-5. Provide per-slice results for browsing and a volume summary
+MEMORY-EFFICIENT DESIGN:
+- Only stores per-slice NUMBERS (areas), not pixel arrays
+- Slice overlays are generated on-demand by re-reading the DICOM file
+- DICOMSeriesLoader reads headers only (stop_before_pixels=True)
+- Full pixel data is loaded one slice at a time during analysis
 
 Author: Auto-Sarcopenia L3 Analyst Project
 License: BSD 3-Clause
 """
 
 import os
+import gc
 import numpy as np
 import pydicom
 from typing import Dict, List, Tuple, Optional, Any
@@ -56,143 +56,151 @@ class VolumetricRatios:
 
 @dataclass
 class SliceResult:
-    """Per-slice analysis result."""
+    """Per-slice analysis result — lightweight, stores only numbers."""
     slice_index: int
     slice_location: Optional[float]
     instance_number: Optional[int]
     areas: TissueAreas
-    hu_image: np.ndarray
-    body_mask: np.ndarray
-    masks: Dict[str, np.ndarray]
-    pixel_area_cm2: float
 
 
 class DICOMSeriesLoader:
     """Loads and sorts an entire DICOM series from multiple files.
 
-    Handles any number of slices — from a handful to thousands.
-    Sorts slices by SliceLocation (preferred) or InstanceNumber.
+    MEMORY-EFFICIENT: reads only DICOM headers during init (no pixel data).
+    Pixel data is loaded on-demand via load_slice_hu().
     """
 
     def __init__(self, dicom_paths: List[str]):
-        """
-        Args:
-            dicom_paths: List of paths to DICOM files belonging to one series.
-        """
         if not dicom_paths:
             raise ValueError("No DICOM files provided")
 
-        self.dicom_paths = dicom_paths
-        self.datasets: List[pydicom.Dataset] = []
         self.sorted_paths: List[str] = []
-        self.slice_thickness: float = 1.0  # mm, will be inferred
+        self.slice_thickness: float = 1.0
         self.pixel_spacing: Tuple[float, float] = (1.0, 1.0)
         self.num_slices: int = 0
+        self._slice_locations: List[Optional[float]] = []
+        self._instance_numbers: List[Optional[int]] = []
+        self._series_metadata: Dict[str, Any] = {}
 
-        self._load_and_sort()
+        self._load_and_sort(dicom_paths)
 
-    def _load_and_sort(self) -> None:
-        """Load all DICOM files and sort by spatial position."""
-        loaded = []
-        for path in self.dicom_paths:
+    def _load_and_sort(self, dicom_paths: List[str]) -> None:
+        """Read headers only, sort by position, store paths."""
+        entries = []
+        for path in dicom_paths:
             try:
-                ds = pydicom.dcmread(path)
-                # Only include files that actually have pixel data
-                if hasattr(ds, 'pixel_array'):
-                    loaded.append((path, ds))
+                ds = pydicom.dcmread(path, stop_before_pixels=True)
+                # Must have basic image attributes
+                if not hasattr(ds, 'Rows') or not hasattr(ds, 'Columns'):
+                    continue
+                loc = getattr(ds, 'SliceLocation', None)
+                inst = getattr(ds, 'InstanceNumber', None)
+                entries.append((path, ds, loc, inst))
             except Exception:
-                # Skip files that can't be read (non-DICOM, corrupted, etc.)
                 continue
 
-        if not loaded:
-            raise ValueError("No valid DICOM files with pixel data found")
+        if not entries:
+            raise ValueError("No valid DICOM files found")
 
-        # Sort by SliceLocation if available, else InstanceNumber, else filename
+        # Sort by SliceLocation > InstanceNumber > filename
         def sort_key(item):
-            _, ds = item
-            loc = getattr(ds, 'SliceLocation', None)
+            _, _, loc, inst = item
             if loc is not None:
                 return float(loc)
-            inst = getattr(ds, 'InstanceNumber', None)
             if inst is not None:
                 return int(inst)
             return 0
 
-        loaded.sort(key=sort_key)
+        entries.sort(key=sort_key)
 
-        self.sorted_paths = [p for p, _ in loaded]
-        self.datasets = [ds for _, ds in loaded]
-        self.num_slices = len(self.datasets)
+        self.sorted_paths = [p for p, _, _, _ in entries]
+        self._slice_locations = [loc for _, _, loc, _ in entries]
+        self._instance_numbers = [inst for _, _, _, inst in entries]
+        self.num_slices = len(entries)
 
-        # Extract common metadata from the first slice
-        ds0 = self.datasets[0]
+        # Extract metadata from first header
+        ds0 = entries[0][1]
         self.pixel_spacing = tuple(
             float(x) for x in getattr(ds0, 'PixelSpacing', [1.0, 1.0])
         )
 
-        # Infer slice thickness: prefer SpacingBetweenSlices, then SliceThickness,
-        # then compute from the actual SliceLocation difference between slices.
+        # Infer slice thickness
         sbs = getattr(ds0, 'SpacingBetweenSlices', None)
         st_ = getattr(ds0, 'SliceThickness', None)
-
         if sbs is not None:
             self.slice_thickness = float(sbs)
         elif st_ is not None:
             self.slice_thickness = float(st_)
-        elif self.num_slices >= 2:
-            loc0 = getattr(self.datasets[0], 'SliceLocation', None)
-            loc1 = getattr(self.datasets[1], 'SliceLocation', None)
-            if loc0 is not None and loc1 is not None:
-                self.slice_thickness = abs(float(loc1) - float(loc0))
-            else:
-                self.slice_thickness = 1.0
+        elif self.num_slices >= 2 and entries[0][2] is not None and entries[1][2] is not None:
+            self.slice_thickness = abs(float(entries[1][2]) - float(entries[0][2]))
         else:
             self.slice_thickness = 1.0
 
-    def get_series_metadata(self) -> Dict[str, Any]:
-        """Return metadata for the whole series."""
-        ds = self.datasets[0]
-        return {
-            'patient_id': getattr(ds, 'PatientID', 'Unknown'),
-            'patient_name': str(getattr(ds, 'PatientName', 'Unknown')),
-            'study_date': getattr(ds, 'StudyDate', 'Unknown'),
-            'series_description': getattr(ds, 'SeriesDescription', 'Unknown'),
+        # Cache series-level metadata so we don't need to keep datasets
+        self._series_metadata = {
+            'patient_id': getattr(ds0, 'PatientID', 'Unknown'),
+            'patient_name': str(getattr(ds0, 'PatientName', 'Unknown')),
+            'study_date': getattr(ds0, 'StudyDate', 'Unknown'),
+            'series_description': getattr(ds0, 'SeriesDescription', 'Unknown'),
             'num_slices': self.num_slices,
             'slice_thickness_mm': self.slice_thickness,
             'pixel_spacing': self.pixel_spacing,
-            'rows': ds.Rows,
-            'columns': ds.Columns,
+            'rows': ds0.Rows,
+            'columns': ds0.Columns,
         }
+        # Datasets are NOT stored — headers are discarded here
+
+    def get_series_metadata(self) -> Dict[str, Any]:
+        return dict(self._series_metadata)
 
     def load_slice_hu(self, index: int) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Load a single slice's HU image and metadata.
+        """Load a single slice's pixel data and convert to HU.
 
-        Args:
-            index: Zero-based slice index (in sorted order)
-
-        Returns:
-            (hu_image, slice_metadata)
+        This is the ONLY method that reads pixel data from disk.
         """
-        ds = self.datasets[index]
+        ds = pydicom.dcmread(self.sorted_paths[index])
         raw = ds.pixel_array.astype(np.float64)
 
-        rescale_slope = getattr(ds, 'RescaleSlope', 1.0)
-        rescale_intercept = getattr(ds, 'RescaleIntercept', 0.0)
+        rescale_slope = float(getattr(ds, 'RescaleSlope', 1.0))
+        rescale_intercept = float(getattr(ds, 'RescaleIntercept', 0.0))
         hu_image = raw * rescale_slope + rescale_intercept
 
         meta = {
-            'slice_location': getattr(ds, 'SliceLocation', None),
-            'instance_number': getattr(ds, 'InstanceNumber', None),
+            'slice_location': self._slice_locations[index],
+            'instance_number': self._instance_numbers[index],
             'slice_index': index,
         }
         return hu_image, meta
 
 
+def _analyze_single_slice(
+    hu_image: np.ndarray,
+    thresholds: HUThresholds,
+    pixel_area_cm2: float,
+) -> TissueAreas:
+    """Run the full segmentation pipeline on one slice and return areas.
+
+    All intermediate arrays (masks, body_mask, etc.) are discarded after
+    this function returns, keeping memory usage constant.
+    """
+    bmg = BodyMaskGenerator(hu_image, thresholds.body_threshold)
+    body_mask = bmg.generate_mask()
+
+    mcg = MuscleCompartmentGenerator(hu_image, body_mask, thresholds)
+    mcg.generate_muscle_compartment(method='connectivity')
+
+    seg = TissueSegmenter(hu_image, body_mask, mcg, thresholds)
+    masks = seg.get_all_masks()
+
+    calc = AreaCalculator(masks, pixel_area_cm2)
+    return calc.calculate_areas()
+
+
 class VolumetricAnalyzer:
     """Full 3D volumetric body composition analysis.
 
-    Processes every slice in a DICOM series, computes per-slice tissue
-    areas, then integrates over the z-axis to produce tissue volumes (cm³).
+    MEMORY-EFFICIENT: processes one slice at a time, discards pixel data,
+    stores only the numeric results (TissueAreas) per slice.
     """
 
     def __init__(
@@ -203,10 +211,7 @@ class VolumetricAnalyzer:
         self.series = series_loader
         self.thresholds = thresholds or HUThresholds()
 
-        # Per-slice results (populated by analyze())
         self.slice_results: List[SliceResult] = []
-
-        # Summary results
         self._volumes: Optional[TissueVolumes] = None
         self._ratios: Optional[VolumetricRatios] = None
 
@@ -216,55 +221,41 @@ class VolumetricAnalyzer:
         weight_kg: float,
         progress_callback=None,
     ) -> Dict[str, Any]:
-        """Run full volumetric analysis.
+        """Run full volumetric analysis (memory-efficient).
 
-        Args:
-            height_m: Patient height in metres.
-            weight_kg: Patient weight in kg.
-            progress_callback: Optional callable(current, total) for UI updates.
-
-        Returns:
-            Dict with 'volumes', 'ratios', 'per_slice', 'metadata', 'bmi'.
+        Processes one slice at a time. Only numeric areas are retained.
         """
         pixel_area_cm2 = (
             self.series.pixel_spacing[0] * self.series.pixel_spacing[1]
         ) / 100.0
-        slice_thickness_cm = self.series.slice_thickness / 10.0  # mm → cm
+        slice_thickness_cm = self.series.slice_thickness / 10.0
 
         self.slice_results = []
 
         for i in range(self.series.num_slices):
+            # Load pixel data for this slice only
             hu_image, slice_meta = self.series.load_slice_hu(i)
 
-            # Body mask
-            bmg = BodyMaskGenerator(hu_image, self.thresholds.body_threshold)
-            body_mask = bmg.generate_mask()
-
-            # Muscle compartment
-            mcg = MuscleCompartmentGenerator(hu_image, body_mask, self.thresholds)
-            mcg.generate_muscle_compartment(method='connectivity')
-
-            # Tissue segmentation
-            seg = TissueSegmenter(hu_image, body_mask, mcg, self.thresholds)
-            masks = seg.get_all_masks()
-
-            # Areas for this slice
-            calc = AreaCalculator(masks, pixel_area_cm2)
-            areas = calc.calculate_areas()
+            # Analyze — returns only areas (numbers)
+            areas = _analyze_single_slice(hu_image, self.thresholds, pixel_area_cm2)
 
             self.slice_results.append(SliceResult(
                 slice_index=i,
                 slice_location=slice_meta.get('slice_location'),
                 instance_number=slice_meta.get('instance_number'),
                 areas=areas,
-                hu_image=hu_image,
-                body_mask=body_mask,
-                masks=masks,
-                pixel_area_cm2=pixel_area_cm2,
             ))
+
+            # Explicitly free the large arrays
+            del hu_image
+            if i % 20 == 0:
+                gc.collect()
 
             if progress_callback:
                 progress_callback(i + 1, self.series.num_slices)
+
+        # Final GC after the loop
+        gc.collect()
 
         # Integrate: volume = Σ (area_i × slice_thickness)
         self._volumes = TissueVolumes(
@@ -302,23 +293,35 @@ class VolumetricAnalyzer:
         window_width: int = 400,
         alpha: float = 0.7,
     ) -> np.ndarray:
-        """Generate RGB overlay for a specific slice.
+        """Generate RGB overlay for a specific slice ON-DEMAND.
 
-        Args:
-            slice_index: Which slice to visualise (0-based).
-            window_center / window_width: CT windowing params.
-            alpha: Overlay opacity.
-
-        Returns:
-            RGB numpy array.
+        Re-reads the DICOM file and re-runs segmentation for just this
+        one slice. This uses memory only while the overlay is being
+        generated, then frees it.
         """
-        sr = self.slice_results[slice_index]
-        viz = Visualizer(sr.hu_image, sr.masks, body_mask=sr.body_mask)
-        return viz.generate_overlay(
+        pixel_area_cm2 = (
+            self.series.pixel_spacing[0] * self.series.pixel_spacing[1]
+        ) / 100.0
+
+        hu_image, _ = self.series.load_slice_hu(slice_index)
+
+        bmg = BodyMaskGenerator(hu_image, self.thresholds.body_threshold)
+        body_mask = bmg.generate_mask()
+
+        mcg = MuscleCompartmentGenerator(hu_image, body_mask, self.thresholds)
+        mcg.generate_muscle_compartment(method='connectivity')
+
+        seg = TissueSegmenter(hu_image, body_mask, mcg, self.thresholds)
+        masks = seg.get_all_masks()
+
+        viz = Visualizer(hu_image, masks, body_mask=body_mask)
+        overlay = viz.generate_overlay(
             window_center=window_center,
             window_width=window_width,
             alpha=alpha,
         )
+
+        return overlay
 
     def get_results_dict(self) -> Dict[str, float]:
         """Flat dict of volumetric results for export."""
