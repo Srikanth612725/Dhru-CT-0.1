@@ -612,6 +612,19 @@ def process_volume_upload(uploaded_files, params: dict):
         )
 
         progress_bar.progress(1.0, text="Analysis complete!")
+
+        # Report L3 detection
+        l3 = results.get('l3_detection')
+        if l3 is not None:
+            conf_pct = f"{l3.confidence:.0%}"
+            loc_str = f" (location: {l3.l3_slice_location:.1f} mm)" if l3.l3_slice_location else ""
+            st.success(
+                f"🎯 **L3 vertebral level auto-detected** at slice #{l3.l3_slice_index}{loc_str} "
+                f"— confidence: {conf_pct} — method: {l3.method}"
+            )
+        else:
+            st.warning("L3 vertebral level could not be auto-detected.")
+
         return vol_analyzer, results
 
     except Exception as e:
@@ -669,39 +682,165 @@ def render_volume_results(results: dict):
         status = "🟢" if nv > 0.5 else "🟡" if nv > 0.3 else "🔴"
         st.metric(f"NAMA/TAMA {status}", f"{nv:.3f}", help="Volumetric muscle quality")
 
+    # L3 Auto-Detection Results
+    l3 = results.get('l3_detection')
+    if l3 is not None and l3.l3_areas is not None:
+        st.divider()
+        st.header("🎯 Auto-Detected L3 Level")
+
+        # Confidence indicator
+        conf = l3.confidence
+        conf_color = "🟢" if conf >= 0.7 else "🟡" if conf >= 0.5 else "🔴"
+        st.markdown(
+            f"**Detection confidence:** {conf_color} {conf:.0%}  \n"
+            f"**Method:** {l3.method}  \n"
+            f"**L3 Slice:** #{l3.l3_slice_index}"
+            + (f" (location: {l3.l3_slice_location:.1f} mm)" if l3.l3_slice_location is not None else "")
+        )
+
+        a = l3.l3_areas
+        nt = a.nama / a.sma if a.sma > 0 else 0
+
+        st.subheader("L3 Single-Slice Areas (cm²) — Clinically Validated")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("🔴 NAMA", f"{a.nama:.2f}",
+                       help="Normal Attenuation Muscle Area at L3")
+        with c2:
+            st.metric("🔵 LAMA", f"{a.lama:.2f}",
+                       help="Low Attenuation Muscle Area at L3")
+        with c3:
+            st.metric("🟡 IMAT", f"{a.imat:.2f}",
+                       help="Intermuscular Adipose Tissue at L3")
+        with c4:
+            st.metric("📐 SMA", f"{a.sma:.2f}",
+                       help="Total Skeletal Muscle Area at L3 (NAMA + LAMA)")
+
+        st.subheader("L3 Clinical Ratios")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            nt_status = "🟢" if nt > 0.66 else "🟡" if nt > 0.50 else "🔴"
+            st.metric(f"NAMA/TAMA {nt_status}", f"{nt:.3f}",
+                       help="Muscle quality at L3. Myosteatosis cutoff: <0.66 (men), <0.65 (women) — Kim et al. 2021")
+        with c2:
+            bmi = results.get('bmi', 1)
+            smi = a.sma / bmi if bmi > 0 else 0
+            st.metric("SMA/BMI", f"{smi:.2f}",
+                       help="Skeletal Muscle Index at L3")
+        with c3:
+            st.metric("NAMA/BMI", f"{(a.nama / bmi if bmi > 0 else 0):.2f}",
+                       help="NAMA index at L3")
+
+        st.markdown(
+            "---\n"
+            "**Reference cutoffs at L3 (Kim et al. 2021, n=20,664):**\n"
+            "- Myosteatosis: NAMA/TAMA < 0.664 (men), < 0.651 (women)\n"
+            "- Sarcopenia (Mourtzakis 2008): SMA < 130 cm² (men), < 80 cm² (women)\n"
+            "- SMI cutoff (Prado 2008): < 52.4 cm²/m² (men), < 38.5 cm²/m² (women)"
+        )
+
+    st.divider()
+
+    # Volumetric note
+    st.info(
+        "**Note on volumetric NAMA/TAMA:** The overall volumetric NAMA/TAMA ratio "
+        f"({ratios.nama_tama_vol:.3f}) includes all body levels (chest through pelvis). "
+        "Published NAMA/LAMA cutoffs are validated only at L3. "
+        "Use the **L3-specific ratios above** for clinical comparison."
+    )
+
+    # Per-slice validation summary
+    per_slice = results.get('per_slice', [])
+    if per_slice:
+        sma_values = [s.areas.sma for s in per_slice]
+        peak_sma = max(sma_values)
+        peak_idx = sma_values.index(peak_sma)
+        mean_sma = sum(sma_values) / len(sma_values)
+
+        with st.expander("🔍 Per-Slice Validation (compare with literature)"):
+            st.markdown(
+                "**Expected L3 single-slice SMA** (Mourtzakis 2008): "
+                "Males 130-190 cm², Females 80-140 cm²"
+            )
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Peak SMA Slice", f"{peak_sma:.1f} cm²",
+                          help=f"Slice #{peak_idx} — likely near L3")
+            with c2:
+                st.metric("Mean SMA/Slice", f"{mean_sma:.1f} cm²")
+            with c3:
+                st.metric("NAMA/TAMA @ Peak",
+                          f"{per_slice[peak_idx].areas.nama / per_slice[peak_idx].areas.sma:.3f}"
+                          if per_slice[peak_idx].areas.sma > 0 else "N/A")
+
 
 def render_slice_browser(vol_analyzer: VolumetricAnalyzer, params: dict):
     """Render an interactive slice browser."""
     st.header("🔬 Slice Browser")
 
     num_slices = len(vol_analyzer.slice_results)
-    slice_idx = st.slider(
-        "Slice",
-        min_value=0,
-        max_value=num_slices - 1,
-        value=num_slices // 2,
-        help="Scroll through slices in the volume"
-    )
 
+    # If L3 was detected, offer a quick-jump button
+    l3_idx = None
+    if vol_analyzer._l3_result is not None:
+        l3_idx = vol_analyzer._l3_result.l3_slice_index
+
+    default_idx = l3_idx if l3_idx is not None else num_slices // 2
+
+    col_slider, col_l3 = st.columns([4, 1])
+    with col_slider:
+        slice_idx = st.slider(
+            "Slice",
+            min_value=0,
+            max_value=num_slices - 1,
+            value=default_idx,
+            help="Scroll through slices in the volume"
+        )
+    with col_l3:
+        if l3_idx is not None:
+            st.markdown(f"**L3 detected:** Slice #{l3_idx}")
+
+    is_l3 = l3_idx is not None and slice_idx == l3_idx
     sr = vol_analyzer.slice_results[slice_idx]
     loc_str = f" (location: {sr.slice_location:.1f} mm)" if sr.slice_location is not None else ""
 
-    overlay = vol_analyzer.get_slice_overlay(
-        slice_idx,
-        window_center=params['window_center'],
-        window_width=params['window_width'],
-        alpha=params['overlay_alpha'],
-    )
+    # For the L3 slice, use L3-specific overlay (standard L3 parameters)
+    if is_l3:
+        overlay = vol_analyzer.get_l3_overlay(
+            window_center=params['window_center'],
+            window_width=params['window_width'],
+            alpha=params['overlay_alpha'],
+        )
+        caption = f"🎯 L3 SLICE — Slice {slice_idx + 1} / {num_slices}{loc_str}"
+    else:
+        overlay = vol_analyzer.get_slice_overlay(
+            slice_idx,
+            window_center=params['window_center'],
+            window_width=params['window_width'],
+            alpha=params['overlay_alpha'],
+        )
+        caption = f"Slice {slice_idx + 1} / {num_slices}{loc_str}"
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        st.image(overlay, caption=f"Slice {slice_idx + 1} / {num_slices}{loc_str}", use_container_width=True)
+        st.image(overlay, caption=caption, use_container_width=True)
     with col2:
-        st.subheader("Slice Areas (cm²)")
-        st.metric("NAMA", f"{sr.areas.nama:.2f}")
-        st.metric("LAMA", f"{sr.areas.lama:.2f}")
-        st.metric("IMAT", f"{sr.areas.imat:.2f}")
-        st.metric("SMA", f"{sr.areas.sma:.2f}")
+        if is_l3:
+            st.subheader("🎯 L3 Areas (cm²)")
+            l3a = vol_analyzer._l3_result.l3_areas
+            st.metric("NAMA", f"{l3a.nama:.2f}")
+            st.metric("LAMA", f"{l3a.lama:.2f}")
+            st.metric("IMAT", f"{l3a.imat:.2f}")
+            st.metric("SMA", f"{l3a.sma:.2f}")
+            nt = l3a.nama / l3a.sma if l3a.sma > 0 else 0
+            nt_status = "🟢" if nt > 0.66 else "🟡" if nt > 0.50 else "🔴"
+            st.metric(f"NAMA/TAMA {nt_status}", f"{nt:.3f}")
+        else:
+            st.subheader("Slice Areas (cm²)")
+            st.metric("NAMA", f"{sr.areas.nama:.2f}")
+            st.metric("LAMA", f"{sr.areas.lama:.2f}")
+            st.metric("IMAT", f"{sr.areas.imat:.2f}")
+            st.metric("SMA", f"{sr.areas.sma:.2f}")
 
         st.divider()
         st.subheader("Legend")
@@ -725,17 +864,27 @@ def render_per_slice_chart(vol_analyzer: VolumetricAnalyzer):
 
     chart_df = df.set_index(x_col)[['NAMA_cm2', 'LAMA_cm2', 'IMAT_cm2', 'SMA_cm2']]
     st.line_chart(chart_df)
-    st.caption(f"X-axis: {x_label}  |  Y-axis: Area (cm²)")
+
+    # Mark L3 position on the chart
+    l3_caption = f"X-axis: {x_label}  |  Y-axis: Area (cm²)"
+    if vol_analyzer._l3_result is not None:
+        l3_loc = vol_analyzer._l3_result.l3_slice_location
+        l3_idx = vol_analyzer._l3_result.l3_slice_index
+        if l3_loc is not None:
+            l3_caption += f"  |  🎯 L3 detected at location {l3_loc:.1f} mm (slice #{l3_idx})"
+        else:
+            l3_caption += f"  |  🎯 L3 detected at slice #{l3_idx}"
+    st.caption(l3_caption)
 
 
 def render_volume_export(vol_analyzer: VolumetricAnalyzer, results: dict):
     """Render export buttons for volumetric results."""
     st.header("💾 Export Volumetric Results")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        # Summary CSV
+        # Summary CSV (now includes L3 metrics)
         summary = vol_analyzer.get_results_dict()
         summary_df = pd.DataFrame([summary])
         csv_summary = summary_df.to_csv(index=False)
@@ -758,6 +907,35 @@ def render_volume_export(vol_analyzer: VolumetricAnalyzer, results: dict):
             mime="text/csv",
             key="vol_perslice_csv",
         )
+
+    with col3:
+        # L3-specific report
+        if vol_analyzer._l3_result is not None and vol_analyzer._l3_result.l3_areas is not None:
+            l3 = vol_analyzer._l3_result
+            a = l3.l3_areas
+            l3_data = {
+                'L3_slice_index': l3.l3_slice_index,
+                'L3_slice_location_mm': l3.l3_slice_location,
+                'detection_confidence': l3.confidence,
+                'detection_method': l3.method,
+                'NAMA_cm2': a.nama,
+                'LAMA_cm2': a.lama,
+                'IMAT_cm2': a.imat,
+                'SMA_cm2': a.sma,
+                'TAMA_cm2': a.sma,
+                'NAMA_TAMA': a.nama / a.sma if a.sma > 0 else 0,
+            }
+            l3_df = pd.DataFrame([l3_data])
+            csv_l3 = l3_df.to_csv(index=False)
+            st.download_button(
+                label="🎯 Download L3 Report (CSV)",
+                data=csv_l3,
+                file_name="l3_analysis.csv",
+                mime="text/csv",
+                key="l3_csv",
+            )
+        else:
+            st.caption("L3 detection not available")
 
 
 # ---------------------------------------------------------------------------

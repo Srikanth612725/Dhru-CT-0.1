@@ -32,6 +32,7 @@ from l3_analyzer import (
     AreaCalculator,
     Visualizer,
 )
+from l3_detector import detect_l3, L3DetectionResult
 
 
 @dataclass
@@ -177,6 +178,8 @@ def _analyze_single_slice(
     hu_image: np.ndarray,
     thresholds: HUThresholds,
     pixel_area_cm2: float,
+    sat_fraction: float = 0.08,
+    muscle_fraction: float = 0.12,
 ) -> TissueAreas:
     """Run the full segmentation pipeline on one slice and return areas.
 
@@ -187,7 +190,11 @@ def _analyze_single_slice(
     body_mask = bmg.generate_mask()
 
     mcg = MuscleCompartmentGenerator(hu_image, body_mask, thresholds)
-    mcg.generate_muscle_compartment(method='connectivity')
+    mcg.generate_muscle_compartment(
+        method='connectivity',
+        sat_fraction=sat_fraction,
+        muscle_fraction=muscle_fraction,
+    )
 
     seg = TissueSegmenter(hu_image, body_mask, mcg, thresholds)
     masks = seg.get_all_masks()
@@ -202,6 +209,13 @@ class VolumetricAnalyzer:
     MEMORY-EFFICIENT: processes one slice at a time, discards pixel data,
     stores only the numeric results (TissueAreas) per slice.
     """
+
+    # Wider muscle band for multi-level volumetric analysis.
+    # At L3 the abdominal wall muscles are thin (8% SAT, 12% muscle band).
+    # At other levels (pelvis, chest) muscles extend deeper.
+    # These widened defaults capture psoas, gluteals, paraspinals, pectorals.
+    VOL_SAT_FRACTION = 0.06    # Slightly thinner SAT zone
+    VOL_MUSCLE_FRACTION = 0.25  # Much wider muscle band (captures deeper muscles)
 
     def __init__(
         self,
@@ -236,8 +250,12 @@ class VolumetricAnalyzer:
             # Load pixel data for this slice only
             hu_image, slice_meta = self.series.load_slice_hu(i)
 
-            # Analyze — returns only areas (numbers)
-            areas = _analyze_single_slice(hu_image, self.thresholds, pixel_area_cm2)
+            # Analyze with wider muscle band for multi-level coverage
+            areas = _analyze_single_slice(
+                hu_image, self.thresholds, pixel_area_cm2,
+                sat_fraction=self.VOL_SAT_FRACTION,
+                muscle_fraction=self.VOL_MUSCLE_FRACTION,
+            )
 
             self.slice_results.append(SliceResult(
                 slice_index=i,
@@ -278,13 +296,25 @@ class VolumetricAnalyzer:
             ),
         )
 
-        return {
+        # Automatic L3 detection
+        self._l3_result: Optional[L3DetectionResult] = None
+        try:
+            self._l3_result = detect_l3(self.series, self.thresholds)
+        except Exception:
+            pass  # L3 detection is best-effort
+
+        result = {
             'volumes': self._volumes,
             'ratios': self._ratios,
             'per_slice': self.slice_results,
             'metadata': self.series.get_series_metadata(),
             'bmi': bmi,
         }
+
+        if self._l3_result is not None:
+            result['l3_detection'] = self._l3_result
+
+        return result
 
     def get_slice_overlay(
         self,
@@ -309,7 +339,11 @@ class VolumetricAnalyzer:
         body_mask = bmg.generate_mask()
 
         mcg = MuscleCompartmentGenerator(hu_image, body_mask, self.thresholds)
-        mcg.generate_muscle_compartment(method='connectivity')
+        mcg.generate_muscle_compartment(
+            method='connectivity',
+            sat_fraction=self.VOL_SAT_FRACTION,
+            muscle_fraction=self.VOL_MUSCLE_FRACTION,
+        )
 
         seg = TissueSegmenter(hu_image, body_mask, mcg, self.thresholds)
         masks = seg.get_all_masks()
@@ -323,11 +357,49 @@ class VolumetricAnalyzer:
 
         return overlay
 
+    def get_l3_overlay(
+        self,
+        window_center: int = 40,
+        window_width: int = 400,
+        alpha: float = 0.7,
+    ) -> Optional[np.ndarray]:
+        """Generate RGB overlay for the auto-detected L3 slice.
+
+        Uses standard L3 parameters (8% SAT, 12% muscle band) for
+        clinically validated segmentation.
+        """
+        if self._l3_result is None:
+            return None
+
+        idx = self._l3_result.l3_slice_index
+        hu_image, _ = self.series.load_slice_hu(idx)
+
+        bmg = BodyMaskGenerator(hu_image, self.thresholds.body_threshold)
+        body_mask = bmg.generate_mask()
+
+        mcg = MuscleCompartmentGenerator(hu_image, body_mask, self.thresholds)
+        mcg.generate_muscle_compartment(
+            method='connectivity',
+            sat_fraction=0.08,   # Standard L3
+            muscle_fraction=0.12,  # Standard L3
+        )
+
+        seg = TissueSegmenter(hu_image, body_mask, mcg, self.thresholds)
+        masks = seg.get_all_masks()
+
+        viz = Visualizer(hu_image, masks, body_mask=body_mask)
+        overlay = viz.generate_overlay(
+            window_center=window_center,
+            window_width=window_width,
+            alpha=alpha,
+        )
+        return overlay
+
     def get_results_dict(self) -> Dict[str, float]:
         """Flat dict of volumetric results for export."""
         if self._volumes is None or self._ratios is None:
             raise RuntimeError("Call analyze() first")
-        return {
+        d = {
             'NAMA_cm3': self._volumes.nama,
             'LAMA_cm3': self._volumes.lama,
             'IMAT_cm3': self._volumes.imat,
@@ -339,6 +411,17 @@ class VolumetricAnalyzer:
             'LAMA_vol_BMI': self._ratios.lama_vol_bmi,
             'NAMA_TAMA_vol': self._ratios.nama_tama_vol,
         }
+        if self._l3_result is not None and self._l3_result.l3_areas is not None:
+            a = self._l3_result.l3_areas
+            d['L3_slice_index'] = self._l3_result.l3_slice_index
+            d['L3_slice_location'] = self._l3_result.l3_slice_location
+            d['L3_confidence'] = self._l3_result.confidence
+            d['L3_NAMA_cm2'] = a.nama
+            d['L3_LAMA_cm2'] = a.lama
+            d['L3_IMAT_cm2'] = a.imat
+            d['L3_SMA_cm2'] = a.sma
+            d['L3_NAMA_TAMA'] = a.nama / a.sma if a.sma > 0 else 0
+        return d
 
     def get_per_slice_dataframe(self):
         """Return a pandas DataFrame with per-slice areas."""
