@@ -516,21 +516,12 @@ def render_export(analyzer: L3Analyzer, results: dict):
 # Volume analysis helpers
 # ---------------------------------------------------------------------------
 
-def _is_dicom_file(filepath: str) -> bool:
-    """Check if a file is a valid DICOM file by reading its header."""
-    try:
-        import pydicom
-        pydicom.dcmread(filepath, stop_before_pixels=True)
-        return True
-    except Exception:
-        return False
-
-
 def _extract_dicom_files_from_upload(uploaded_files) -> List[str]:
-    """Save uploaded DICOM files to a temp directory and return paths.
+    """Save uploaded files to a temp directory and return all candidate paths.
 
     Handles .dcm files, extensionless DICOM files (IM0, IM1, ...),
-    and .zip archives containing any of the above.
+    and .zip archives. Validation is deferred to DICOMSeriesLoader
+    (which reads headers) to avoid double-reading every file.
     """
     tmp_dir = tempfile.mkdtemp(prefix="dicom_series_")
     candidate_paths: List[str] = []
@@ -539,14 +530,12 @@ def _extract_dicom_files_from_upload(uploaded_files) -> List[str]:
         name_lower = uf.name.lower()
 
         if name_lower.endswith('.zip'):
-            # Extract ZIP contents
             zip_path = os.path.join(tmp_dir, uf.name)
             with open(zip_path, 'wb') as f:
                 f.write(uf.getvalue())
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 zf.extractall(tmp_dir)
             os.unlink(zip_path)
-            # Walk extracted tree — include all non-directory files
             for root, _dirs, files in os.walk(tmp_dir):
                 for fname in files:
                     if not fname.startswith('.'):
@@ -557,9 +546,7 @@ def _extract_dicom_files_from_upload(uploaded_files) -> List[str]:
                 f.write(uf.getvalue())
             candidate_paths.append(dest)
 
-    # Filter to actual DICOM files (handles extensionless files like IM0, IM1, ...)
-    paths = [p for p in candidate_paths if _is_dicom_file(p)]
-    return paths
+    return candidate_paths
 
 
 def render_volume_upload():
