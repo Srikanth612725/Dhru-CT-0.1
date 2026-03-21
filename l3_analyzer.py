@@ -874,14 +874,15 @@ class TissueSegmenter:
     def segment_sma(self) -> np.ndarray:
         """Segment Total Skeletal Muscle Area (-29 to +150 HU).
 
-        Uses a two-step approach to match validated tools (CoreSlicer, SliceOmatic):
+        Uses iterative region-growing from NAMA seeds:
         1. NAMA (30-150 HU) = definite muscle tissue (seed regions)
-        2. LAMA (-29 to +29 HU) = only included if spatially connected to NAMA
+        2. LAMA (-29 to +29 HU) = grown outward from NAMA pixel-by-pixel
+           using iterative dilation (flood-fill within muscle compartment)
 
-        This ensures that non-muscle soft tissue (fascia, subcutaneous edges,
-        partial-volume artifacts) with HU -29 to +29 is excluded from SMA.
-        Fat-infiltrated muscle (true LAMA) is always adjacent to normal
-        muscle (NAMA) within the same fascial compartment.
+        This avoids the connected-component flaw where an entire blob of
+        non-muscle tissue gets included because one pixel touches NAMA.
+        Instead, only LAMA pixels that are spatially contiguous with NAMA
+        — reachable step-by-step through adjacent LAMA pixels — are counted.
 
         Clinical Reference:
             Mourtzakis M et al., Appl Physiol Nutr Metab, 2008
@@ -913,25 +914,24 @@ class TissueSegmenter:
                 valid_region
             )
 
-            # Step 3: Only keep LAMA pixels connected to NAMA regions.
-            # Dilate NAMA slightly to define the "muscle group neighborhood".
-            # A small dilation (2px) captures LAMA at muscle edges without
-            # reaching into distant non-muscle tissue.
-            nama_neighborhood = morphology.dilation(
-                nama_candidates, morphology.disk(2)
-            )
+            # Step 3: Iterative region-growing from NAMA into LAMA.
+            # Start with NAMA as seeds. On each iteration, dilate by 1px
+            # and pick up adjacent LAMA pixels. Repeat until no new LAMA
+            # pixels are added. This is a flood-fill that stops at non-LAMA
+            # boundaries, so organ tissue that merely touches muscle at one
+            # point won't cause an entire blob to be included.
+            grown_mask = nama_candidates.copy()
+            selem = morphology.disk(1)
+            max_iterations = 50  # safety limit
+            for _ in range(max_iterations):
+                dilated = morphology.dilation(grown_mask, selem)
+                new_lama = dilated & lama_candidates & ~grown_mask
+                if not np.any(new_lama):
+                    break
+                grown_mask = grown_mask | new_lama
 
-            # Label connected components of LAMA and keep only those
-            # that overlap with the NAMA neighborhood
-            labeled_lama = measure.label(lama_candidates)
-            connected_lama = np.zeros_like(lama_candidates)
-            for region in measure.regionprops(labeled_lama):
-                region_mask = labeled_lama == region.label
-                if np.any(region_mask & nama_neighborhood):
-                    connected_lama |= region_mask
-
-            # SMA = NAMA + connected LAMA
-            self._sma_mask = (nama_candidates | connected_lama).astype(bool)
+            # SMA = NAMA + grown LAMA
+            self._sma_mask = grown_mask.astype(bool)
 
         return self._sma_mask
     

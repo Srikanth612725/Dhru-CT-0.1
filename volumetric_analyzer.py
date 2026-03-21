@@ -210,12 +210,12 @@ class VolumetricAnalyzer:
     stores only the numeric results (TissueAreas) per slice.
     """
 
-    # Wider muscle band for multi-level volumetric analysis.
-    # At L3 the abdominal wall muscles are thin (8% SAT, 12% muscle band).
-    # At other levels (pelvis, chest) muscles extend deeper.
-    # These widened defaults capture psoas, gluteals, paraspinals, pectorals.
-    VOL_SAT_FRACTION = 0.06    # Slightly thinner SAT zone
-    VOL_MUSCLE_FRACTION = 0.25  # Much wider muscle band (captures deeper muscles)
+    # Muscle band for multi-level volumetric analysis.
+    # Must balance capturing deep muscles (psoas) vs. excluding organs.
+    # 0.15 gives ~4-6 cm depth at typical body sizes, enough for
+    # abdominal wall muscles + psoas without reaching visceral organs.
+    VOL_SAT_FRACTION = 0.08    # Match L3 SAT zone depth
+    VOL_MUSCLE_FRACTION = 0.15  # Moderate band: captures muscles, excludes organs
 
     def __init__(
         self,
