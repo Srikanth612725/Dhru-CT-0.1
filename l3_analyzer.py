@@ -874,70 +874,102 @@ class TissueSegmenter:
     def segment_sma(self) -> np.ndarray:
         """Segment Total Skeletal Muscle Area (-29 to +150 HU).
 
-        Uses the muscle compartment mask to restrict SMA to skeletal
-        muscles only, excluding organs and viscera. Also explicitly
-        excludes bone tissue (HU > bone_threshold).
+        Uses a two-step approach to match validated tools (CoreSlicer, SliceOmatic):
+        1. NAMA (30-150 HU) = definite muscle tissue (seed regions)
+        2. LAMA (-29 to +29 HU) = only included if spatially connected to NAMA
 
-        Per the reference (Mourtzakis et al. 2008), SMA should include
-        only skeletal muscle groups (psoas, paraspinals, abdominal wall).
+        This ensures that non-muscle soft tissue (fascia, subcutaneous edges,
+        partial-volume artifacts) with HU -29 to +29 is excluded from SMA.
+        Fat-infiltrated muscle (true LAMA) is always adjacent to normal
+        muscle (NAMA) within the same fascial compartment.
+
+        Clinical Reference:
+            Mourtzakis M et al., Appl Physiol Nutr Metab, 2008
+            Prado CM et al., Lancet Oncol, 2008
 
         Returns:
             Binary mask of SMA pixels
         """
         if self._sma_mask is None:
-            # Use muscle compartment mask to exclude organs
             muscle_region = self.muscle_compartment_generator.muscle_compartment_mask
-
-            # Exclude bone pixels explicitly
             bone_exclusion = self.hu_image <= self.thresholds.bone_threshold
+            valid_region = muscle_region & bone_exclusion
 
-            self._sma_mask = self._create_tissue_mask(
-                self.thresholds.sma_min,
-                self.thresholds.sma_max,
-                muscle_region & bone_exclusion,
-                min_region_size=50
+            # Step 1: Find NAMA (definite muscle) within muscle compartment
+            nama_candidates = (
+                (self.hu_image >= self.thresholds.nama_min) &
+                (self.hu_image <= self.thresholds.nama_max) &
+                valid_region
             )
+            # Remove tiny noise regions
+            nama_candidates = morphology.remove_small_objects(
+                nama_candidates, max_size=50
+            )
+
+            # Step 2: Find LAMA candidates within muscle compartment
+            lama_candidates = (
+                (self.hu_image >= self.thresholds.lama_min) &
+                (self.hu_image <= self.thresholds.lama_max) &
+                valid_region
+            )
+
+            # Step 3: Only keep LAMA pixels connected to NAMA regions.
+            # Dilate NAMA slightly to define the "muscle group neighborhood".
+            # A small dilation (2px) captures LAMA at muscle edges without
+            # reaching into distant non-muscle tissue.
+            nama_neighborhood = morphology.dilation(
+                nama_candidates, morphology.disk(2)
+            )
+
+            # Label connected components of LAMA and keep only those
+            # that overlap with the NAMA neighborhood
+            labeled_lama = measure.label(lama_candidates)
+            connected_lama = np.zeros_like(lama_candidates)
+            for region in measure.regionprops(labeled_lama):
+                region_mask = labeled_lama == region.label
+                if np.any(region_mask & nama_neighborhood):
+                    connected_lama |= region_mask
+
+            # SMA = NAMA + connected LAMA
+            self._sma_mask = (nama_candidates | connected_lama).astype(bool)
+
         return self._sma_mask
     
     def segment_nama(self) -> np.ndarray:
         """Segment Normal Attenuation Muscle Area (+30 to +150 HU).
-        
-        NAMA is calculated as a subset of SMA to ensure consistency.
-        NAMA + LAMA = SMA
-        
+
+        NAMA represents healthy muscle with minimal fat infiltration.
+        Computed as a subset of SMA to ensure NAMA + LAMA = SMA.
+
         Returns:
             Binary mask of NAMA pixels
         """
         if self._nama_mask is None:
-            # First ensure SMA is calculated
             sma_mask = self.segment_sma()
-            
-            # NAMA is the portion of SMA with HU >= nama_min
             self._nama_mask = (
-                (self.hu_image >= self.thresholds.nama_min) & 
+                (self.hu_image >= self.thresholds.nama_min) &
                 (self.hu_image <= self.thresholds.nama_max) &
-                sma_mask  # Must be within SMA
+                sma_mask
             )
         return self._nama_mask
-    
+
     def segment_lama(self) -> np.ndarray:
         """Segment Low Attenuation Muscle Area (-29 to +29 HU).
-        
-        LAMA is calculated as a subset of SMA to ensure consistency.
-        NAMA + LAMA = SMA
-        
+
+        LAMA represents fat-infiltrated muscle (myosteatosis marker).
+        Only includes LAMA pixels that are spatially connected to NAMA
+        regions, ensuring they represent actual muscle tissue rather than
+        non-muscle soft tissue with similar HU values.
+
         Returns:
             Binary mask of LAMA pixels
         """
         if self._lama_mask is None:
-            # First ensure SMA is calculated
             sma_mask = self.segment_sma()
-            
-            # LAMA is the portion of SMA with HU < nama_min (i.e., -29 to +29)
             self._lama_mask = (
-                (self.hu_image >= self.thresholds.lama_min) & 
+                (self.hu_image >= self.thresholds.lama_min) &
                 (self.hu_image <= self.thresholds.lama_max) &
-                sma_mask  # Must be within SMA
+                sma_mask
             )
         return self._lama_mask
     
