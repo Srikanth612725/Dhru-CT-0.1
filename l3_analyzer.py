@@ -628,17 +628,19 @@ class MuscleCompartmentGenerator:
 
         # Step 5: Detect vertebral body and add BILATERAL PSOAS ZONES
         #
-        # At L3, the psoas major sits bilaterally adjacent to the vertebral
-        # body and transverse processes. It is DEEP (beyond the peripheral
-        # muscle band) and must be captured separately.
+        # At L3, the psoas major sits ANTEROLATERAL to the vertebral body
+        # (in front of the transverse processes). It is a compact, oval
+        # muscle — NOT the erector spinae (which are POSTERIOR).
+        #
+        # Key anatomy:
+        #   - Psoas is ANTERIOR to the vertebral centroid (lower row index)
+        #   - Psoas is LATERAL to the vertebral body
+        #   - Erector spinae is POSTERIOR (higher row index) — NOT psoas
         #
         # Strategy:
-        # - Find vertebral bone (HU > 200)
-        # - Locate the vertebral body (largest bone cluster)
-        # - Create TWO elliptical search zones: one LEFT, one RIGHT
-        #   of the vertebra (psoas is lateral, not centered)
-        # - The psoas zone is where we LOOK for muscle — actual psoas
-        #   pixels are identified by SMA HU range within this zone
+        #   1. Find the vertebral body
+        #   2. Create two small elliptical zones ANTEROLATERAL to it
+        #   3. Restrict to ANTERIOR half only (row < vertebra centroid)
         bone_mask = (self.hu_image > 200) & self.body_mask
         bone_mask = morphology.remove_small_objects(bone_mask, max_size=100)
 
@@ -651,18 +653,19 @@ class MuscleCompartmentGenerator:
                 vertebra = max(bone_regions, key=lambda r: r.area)
                 vert_centroid_r, vert_centroid_c = vertebra.centroid
 
-                # Psoas zone parameters — sized relative to body
-                # The psoas is an oval muscle ~3-5 cm long axis at L3
-                psoas_r_vert = max(25, int(body_minor * 0.08))   # vertical radius
-                psoas_r_lat = max(20, int(body_minor * 0.06))    # lateral radius
-                # Lateral offset: psoas center is ~2-3 cm lateral to vertebra center
-                lateral_offset = max(20, int(body_minor * 0.07))
-                # Slight anterior offset: psoas is anterolateral to vertebral body
-                anterior_offset = max(5, int(body_minor * 0.02))
+                # Psoas zone parameters — compact, matching real psoas size
+                # Psoas at L3 is roughly 2-4 cm x 1.5-3 cm
+                psoas_r_vert = max(18, int(body_minor * 0.055))   # ~1.5-2 cm
+                psoas_r_lat = max(14, int(body_minor * 0.045))    # ~1-1.5 cm
+                # Lateral offset: psoas center is ~2-3 cm lateral
+                lateral_offset = max(18, int(body_minor * 0.06))
+                # Anterior offset: psoas is significantly anterior to
+                # vertebral centroid (in front of transverse processes)
+                anterior_offset = max(15, int(body_minor * 0.05))
 
                 rr, cc = np.ogrid[:self.hu_image.shape[0], :self.hu_image.shape[1]]
 
-                # Left psoas (higher column index = patient's left in standard view)
+                # Left psoas (anterolateral)
                 left_center_r = vert_centroid_r - anterior_offset
                 left_center_c = vert_centroid_c + lateral_offset
                 left_ellipse = (
@@ -670,7 +673,7 @@ class MuscleCompartmentGenerator:
                     ((cc - left_center_c) / psoas_r_lat) ** 2
                 ) <= 1.0
 
-                # Right psoas (lower column index)
+                # Right psoas (anterolateral)
                 right_center_r = vert_centroid_r - anterior_offset
                 right_center_c = vert_centroid_c - lateral_offset
                 right_ellipse = (
@@ -679,9 +682,13 @@ class MuscleCompartmentGenerator:
                 ) <= 1.0
 
                 psoas_zone = (left_ellipse | right_ellipse) & self.body_mask
-                # Exclude vertebral bone itself, SAT zone, and peripheral band
-                # (muscle already captured in peripheral band shouldn't be
-                # double-counted as psoas)
+
+                # CRITICAL: Only keep ANTERIOR to vertebra (lower row index).
+                # This excludes erector spinae and other posterior paraspinals.
+                rr_full = np.arange(self.hu_image.shape[0])[:, np.newaxis]
+                psoas_zone = psoas_zone & (rr_full <= vert_centroid_r)
+
+                # Exclude vertebral bone and SAT zone
                 psoas_zone = psoas_zone & ~bone_mask & ~subcutaneous_mask
 
         # Step 6: Combined muscle compartment = peripheral band + psoas zone
