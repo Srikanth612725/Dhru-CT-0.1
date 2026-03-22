@@ -552,20 +552,21 @@ class MuscleCompartmentGenerator:
 
         Produces three compartments:
         - Subcutaneous fat (SAT): fat connected to the body outline
-        - Muscle compartment: skeletal muscles at the body wall periphery
+        - Muscle compartment: peripheral muscle band + psoas zone near vertebra
         - Visceral cavity: organs and visceral fat in the center (EXCLUDED)
 
         Strategy:
         1. Identify body outline and classify fat as SAT vs interior fat
-        2. Find the SAT layer boundary (inner edge of subcutaneous fat)
-        3. Define muscle compartment as a band inward from the SAT boundary
+        2. Define peripheral muscle band (abdominal wall muscles)
+        3. Detect vertebral body and add psoas zone around it
         4. IMAT = only SMALL fat pockets within the muscle compartment
-           (large interior fat regions = visceral fat, excluded)
 
         Clinical Reference:
             Shen W et al. Am J Clin Nutr 2004
             Mourtzakis M et al. Appl Physiol Nutr Metab 2008
         """
+
+        from scipy.ndimage import distance_transform_edt
 
         # Step 1: Get the body outline (outer boundary)
         body_outline = self.body_mask & ~morphology.erosion(
@@ -598,59 +599,78 @@ class MuscleCompartmentGenerator:
             else:
                 interior_fat_mask |= region_mask
 
-        # Step 4: Define muscle compartment as a BAND near the body wall
-        #
-        # At L3 level, skeletal muscles form a peripheral ring:
-        # - Abdominal wall: rectus abdominis, obliques, transverse abdominis
-        # - Posterior: psoas, erector spinae, quadratus lumborum
-        #
-        # These sit BETWEEN the SAT (outer) and visceral cavity (inner).
-        # We use distance from the BODY BOUNDARY (not SAT) to define zones,
-        # because HU-based SAT detection often fails for JPEG photos.
-        #
-        # Geometry (from body boundary inward):
-        #   [0, sat_depth)       = SAT zone (subcutaneous fat)
-        #   [sat_depth, muscle_end) = Muscle band (skeletal muscles + IMAT)
-        #   [muscle_end, ...)    = Visceral cavity (organs, excluded)
-
-        from scipy.ndimage import distance_transform_edt
-
-        # Distance from body boundary for every pixel inside the body
+        # Step 4: Define PERIPHERAL muscle band (abdominal wall muscles)
         dist_from_boundary = distance_transform_edt(self.body_mask)
 
-        # Adaptive zone depths based on body size
         body_rows = np.any(self.body_mask, axis=1)
         body_height = np.sum(body_rows)
         body_cols = np.any(self.body_mask, axis=0)
         body_width = np.sum(body_cols)
         body_minor = min(body_height, body_width)
 
-        # SAT zone: outer fraction of body (default 8%, ~1-2 cm at L3)
         sat_depth = max(15, int(body_minor * sat_fraction))
-        # Muscle band: next fraction of body (default 12%, ~2-4 cm at L3)
         muscle_depth = max(20, int(body_minor * muscle_fraction))
         muscle_end = sat_depth + muscle_depth
 
-        # Geometric SAT zone (always applied, regardless of HU detection)
+        # Geometric SAT zone
         geometric_sat = self.body_mask & (dist_from_boundary <= sat_depth)
-        # Merge with HU-detected SAT
         subcutaneous_mask = subcutaneous_mask | geometric_sat
 
-        # Muscle band = between SAT zone and visceral cavity
+        # Peripheral muscle band (abdominal wall)
         muscle_band = self.body_mask & (
             (dist_from_boundary > sat_depth) &
             (dist_from_boundary <= muscle_end)
         )
 
-        # Only include muscle-density and bone tissue in the compartment
+        # Step 5: Detect vertebral body and add PSOAS ZONE
+        #
+        # At L3, the psoas major sits bilaterally adjacent to the vertebral
+        # body. It is DEEP (beyond the peripheral muscle band) but must be
+        # included in SMA. Strategy:
+        # - Find vertebral bone (HU > 200, dense cortical/cancellous bone)
+        # - Detect the largest bone cluster (the vertebral body)
+        # - Create a psoas zone extending laterally from the vertebra
+        # - Include muscle-density tissue in this zone
+        bone_mask = (self.hu_image > 200) & self.body_mask
+        bone_mask = morphology.remove_small_objects(bone_mask, max_size=100)
+
+        psoas_zone = np.zeros_like(self.body_mask)
+        if np.any(bone_mask):
+            labeled_bone = measure.label(bone_mask)
+            bone_regions = measure.regionprops(labeled_bone)
+            if bone_regions:
+                # Find the largest bone region (vertebral body)
+                vertebra = max(bone_regions, key=lambda r: r.area)
+                vert_centroid_r, vert_centroid_c = vertebra.centroid
+
+                # Psoas zone: elliptical region around vertebra
+                # Extends wider laterally (psoas is lateral to vertebra)
+                # and narrower vertically (psoas is at the same level)
+                psoas_radius_lateral = max(30, int(body_minor * 0.12))
+                psoas_radius_vertical = max(20, int(body_minor * 0.06))
+
+                rr, cc = np.ogrid[:self.hu_image.shape[0], :self.hu_image.shape[1]]
+                ellipse = (
+                    ((rr - vert_centroid_r) / psoas_radius_vertical) ** 2 +
+                    ((cc - vert_centroid_c) / psoas_radius_lateral) ** 2
+                ) <= 1.0
+                psoas_zone = ellipse & self.body_mask
+
+                # Exclude the vertebral bone itself and SAT zone
+                psoas_zone = psoas_zone & ~bone_mask & ~subcutaneous_mask
+
+        # Step 6: Combined muscle compartment = peripheral band + psoas zone
+        combined_valid_zone = muscle_band | psoas_zone
+
+        # Only include muscle-density tissue in the compartment
         muscle_tissue = (
             (self.hu_image >= self.thresholds.sma_min) &
             (self.hu_image <= self.thresholds.sma_max) &
-            muscle_band
+            combined_valid_zone
         )
         bone_tissue = (
             (self.hu_image > self.thresholds.bone_threshold) &
-            muscle_band
+            muscle_band  # bone only in peripheral band, not psoas zone
         )
 
         structural = muscle_tissue | bone_tissue
@@ -658,13 +678,13 @@ class MuscleCompartmentGenerator:
 
         # Dilate slightly to include small IMAT pockets between muscle groups
         muscle_compartment = morphology.dilation(structural, morphology.disk(3))
-        muscle_compartment = muscle_compartment & muscle_band
+        muscle_compartment = muscle_compartment & combined_valid_zone
 
-        # Step 5: IMAT = small fat pockets WITHIN the muscle band only
+        # Step 7: IMAT = small fat pockets WITHIN the muscle compartment only
         imat_mask = np.zeros_like(all_fat)
-        interior_in_band = interior_fat_mask & muscle_band
+        interior_in_compartment = interior_fat_mask & combined_valid_zone
 
-        labeled_interior = measure.label(interior_in_band)
+        labeled_interior = measure.label(interior_in_compartment)
         max_imat_size = 2000
         for region in measure.regionprops(labeled_interior):
             if region.area <= max_imat_size:
