@@ -653,15 +653,25 @@ class MuscleCompartmentGenerator:
                 vertebra = max(bone_regions, key=lambda r: r.area)
                 vert_centroid_r, vert_centroid_c = vertebra.centroid
 
-                # Psoas zone parameters — compact, matching real psoas size
-                # Psoas at L3 is roughly 2-4 cm x 1.5-3 cm
-                psoas_r_vert = max(18, int(body_minor * 0.055))   # ~1.5-2 cm
-                psoas_r_lat = max(14, int(body_minor * 0.045))    # ~1-1.5 cm
-                # Lateral offset: psoas center is ~2-3 cm lateral
-                lateral_offset = max(18, int(body_minor * 0.06))
-                # Anterior offset: psoas is significantly anterior to
-                # vertebral centroid (in front of transverse processes)
-                anterior_offset = max(15, int(body_minor * 0.05))
+                # Psoas zone parameters — based on anatomy at L3
+                # The psoas major is a substantial oval muscle, roughly
+                # 3-5 cm (anterior-posterior) x 2-4 cm (medial-lateral).
+                # It sits well lateral and anterior to the vertebral body,
+                # adjacent to the anterolateral surface of the vertebra.
+                #
+                # Use the bounding box of the vertebra for more accurate
+                # scaling (vertebral body is ~3-4 cm wide at L3).
+                vert_bbox = vertebra.bbox  # (min_row, min_col, max_row, max_col)
+                vert_height = vert_bbox[2] - vert_bbox[0]
+                vert_width = vert_bbox[3] - vert_bbox[1]
+
+                # Psoas search ellipse radii — generous to capture full muscle
+                psoas_r_vert = max(25, int(vert_height * 0.9))
+                psoas_r_lat = max(20, int(vert_width * 0.7))
+                # Lateral offset: psoas center is ~1 vertebral width lateral
+                lateral_offset = max(25, int(vert_width * 1.0))
+                # Anterior offset: psoas is well anterior to vertebral centroid
+                anterior_offset = max(20, int(vert_height * 0.7))
 
                 rr, cc = np.ogrid[:self.hu_image.shape[0], :self.hu_image.shape[1]]
 
@@ -684,9 +694,11 @@ class MuscleCompartmentGenerator:
                 psoas_zone = (left_ellipse | right_ellipse) & self.body_mask
 
                 # CRITICAL: Only keep ANTERIOR to vertebra (lower row index).
-                # This excludes erector spinae and other posterior paraspinals.
+                # Allow a small margin past centroid since psoas wraps
+                # slightly around the anterolateral surface of the vertebra.
+                posterior_margin = max(5, int(vert_height * 0.3))
                 rr_full = np.arange(self.hu_image.shape[0])[:, np.newaxis]
-                psoas_zone = psoas_zone & (rr_full <= vert_centroid_r)
+                psoas_zone = psoas_zone & (rr_full <= vert_centroid_r + posterior_margin)
 
                 # Exclude vertebral bone and SAT zone
                 psoas_zone = psoas_zone & ~bone_mask & ~subcutaneous_mask
