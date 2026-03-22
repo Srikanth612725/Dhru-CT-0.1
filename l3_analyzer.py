@@ -88,20 +88,22 @@ class HUThresholds:
 @dataclass
 class TissueAreas:
     """Container for calculated tissue areas in cm².
-    
+
     Attributes:
         nama: Normal Attenuation Muscle Area (cm²)
         lama: Low Attenuation Muscle Area (cm²)
         imat: Intermuscular Adipose Tissue (cm²)
         sma: Total Skeletal Muscle Area (cm²)
         tama: Total Abdominal Muscle Area (cm²)
-        sat: Subcutaneous Adipose Tissue (cm²) - NEW
+        psoas: Psoas Muscle Area (cm²) - bilateral total
+        sat: Subcutaneous Adipose Tissue (cm²)
     """
     nama: float
     lama: float
     imat: float
     sma: float
     tama: float
+    psoas: float = 0.0  # Psoas muscle area (included in SMA)
     sat: float = 0.0  # Subcutaneous fat (for reference)
 
 
@@ -135,6 +137,7 @@ class VisualizationColors:
     nama: Tuple[float, float, float] = (1.0, 0.0, 0.0)    # Red
     lama: Tuple[float, float, float] = (0.0, 1.0, 1.0)    # Cyan
     imat: Tuple[float, float, float] = (1.0, 1.0, 0.0)    # Yellow
+    psoas: Tuple[float, float, float] = (0.0, 1.0, 0.0)   # Green (psoas muscles)
     sat: Tuple[float, float, float] = (0.0, 0.5, 0.0)     # Dark Green (subcutaneous fat)
     background: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # Black
 
@@ -513,6 +516,7 @@ class MuscleCompartmentGenerator:
         self._muscle_compartment_mask: Optional[np.ndarray] = None
         self._subcutaneous_fat_mask: Optional[np.ndarray] = None
         self._imat_mask: Optional[np.ndarray] = None
+        self._psoas_zone_mask: Optional[np.ndarray] = None
     
     def generate_muscle_compartment(self,
                                     boundary_dilation: int = 5,
@@ -622,15 +626,19 @@ class MuscleCompartmentGenerator:
             (dist_from_boundary <= muscle_end)
         )
 
-        # Step 5: Detect vertebral body and add PSOAS ZONE
+        # Step 5: Detect vertebral body and add BILATERAL PSOAS ZONES
         #
         # At L3, the psoas major sits bilaterally adjacent to the vertebral
-        # body. It is DEEP (beyond the peripheral muscle band) but must be
-        # included in SMA. Strategy:
-        # - Find vertebral bone (HU > 200, dense cortical/cancellous bone)
-        # - Detect the largest bone cluster (the vertebral body)
-        # - Create a psoas zone extending laterally from the vertebra
-        # - Include muscle-density tissue in this zone
+        # body and transverse processes. It is DEEP (beyond the peripheral
+        # muscle band) and must be captured separately.
+        #
+        # Strategy:
+        # - Find vertebral bone (HU > 200)
+        # - Locate the vertebral body (largest bone cluster)
+        # - Create TWO elliptical search zones: one LEFT, one RIGHT
+        #   of the vertebra (psoas is lateral, not centered)
+        # - The psoas zone is where we LOOK for muscle — actual psoas
+        #   pixels are identified by SMA HU range within this zone
         bone_mask = (self.hu_image > 200) & self.body_mask
         bone_mask = morphology.remove_small_objects(bone_mask, max_size=100)
 
@@ -643,20 +651,37 @@ class MuscleCompartmentGenerator:
                 vertebra = max(bone_regions, key=lambda r: r.area)
                 vert_centroid_r, vert_centroid_c = vertebra.centroid
 
-                # Psoas zone: elliptical region around vertebra
-                # Extends wider laterally (psoas is lateral to vertebra)
-                # and narrower vertically (psoas is at the same level)
-                psoas_radius_lateral = max(30, int(body_minor * 0.12))
-                psoas_radius_vertical = max(20, int(body_minor * 0.06))
+                # Psoas zone parameters — sized relative to body
+                # The psoas is an oval muscle ~3-5 cm long axis at L3
+                psoas_r_vert = max(25, int(body_minor * 0.08))   # vertical radius
+                psoas_r_lat = max(20, int(body_minor * 0.06))    # lateral radius
+                # Lateral offset: psoas center is ~2-3 cm lateral to vertebra center
+                lateral_offset = max(20, int(body_minor * 0.07))
+                # Slight anterior offset: psoas is anterolateral to vertebral body
+                anterior_offset = max(5, int(body_minor * 0.02))
 
                 rr, cc = np.ogrid[:self.hu_image.shape[0], :self.hu_image.shape[1]]
-                ellipse = (
-                    ((rr - vert_centroid_r) / psoas_radius_vertical) ** 2 +
-                    ((cc - vert_centroid_c) / psoas_radius_lateral) ** 2
-                ) <= 1.0
-                psoas_zone = ellipse & self.body_mask
 
-                # Exclude the vertebral bone itself and SAT zone
+                # Left psoas (higher column index = patient's left in standard view)
+                left_center_r = vert_centroid_r - anterior_offset
+                left_center_c = vert_centroid_c + lateral_offset
+                left_ellipse = (
+                    ((rr - left_center_r) / psoas_r_vert) ** 2 +
+                    ((cc - left_center_c) / psoas_r_lat) ** 2
+                ) <= 1.0
+
+                # Right psoas (lower column index)
+                right_center_r = vert_centroid_r - anterior_offset
+                right_center_c = vert_centroid_c - lateral_offset
+                right_ellipse = (
+                    ((rr - right_center_r) / psoas_r_vert) ** 2 +
+                    ((cc - right_center_c) / psoas_r_lat) ** 2
+                ) <= 1.0
+
+                psoas_zone = (left_ellipse | right_ellipse) & self.body_mask
+                # Exclude vertebral bone itself, SAT zone, and peripheral band
+                # (muscle already captured in peripheral band shouldn't be
+                # double-counted as psoas)
                 psoas_zone = psoas_zone & ~bone_mask & ~subcutaneous_mask
 
         # Step 6: Combined muscle compartment = peripheral band + psoas zone
@@ -693,6 +718,7 @@ class MuscleCompartmentGenerator:
         self._muscle_compartment_mask = muscle_compartment.astype(bool)
         self._subcutaneous_fat_mask = subcutaneous_mask.astype(bool)
         self._imat_mask = imat_mask.astype(bool)
+        self._psoas_zone_mask = psoas_zone.astype(bool)
 
         return self._muscle_compartment_mask
     
@@ -804,6 +830,13 @@ class MuscleCompartmentGenerator:
         """Get the IMAT mask."""
         return self.get_imat_mask()
 
+    @property
+    def psoas_zone_mask(self) -> np.ndarray:
+        """Get the psoas search zone mask (bilateral, around vertebra)."""
+        if self._psoas_zone_mask is None:
+            self.generate_muscle_compartment(method='connectivity')
+        return self._psoas_zone_mask
+
 
 class TissueSegmenter:
     """Segments tissues based on Hounsfield Unit thresholds.
@@ -862,6 +895,7 @@ class TissueSegmenter:
         self._imat_mask: Optional[np.ndarray] = None
         self._sma_mask: Optional[np.ndarray] = None
         self._sat_mask: Optional[np.ndarray] = None
+        self._psoas_mask: Optional[np.ndarray] = None
     
     def _create_tissue_mask(self, 
                             hu_min: int, 
@@ -993,12 +1027,31 @@ class TissueSegmenter:
             )
         return self._lama_mask
     
+    def segment_psoas(self) -> np.ndarray:
+        """Segment psoas muscles (SMA tissue within the psoas zone).
+
+        Psoas = muscle-density tissue (-29 to +150 HU) located within
+        the bilateral psoas zones adjacent to the vertebral body.
+        Psoas pixels are a SUBSET of SMA (they are included in SMA total).
+
+        Returns:
+            Binary mask of psoas muscle pixels
+        """
+        if self._psoas_mask is None:
+            sma_mask = self.segment_sma()
+            psoas_zone = self.muscle_compartment_generator.psoas_zone_mask
+            if psoas_zone is not None:
+                self._psoas_mask = sma_mask & psoas_zone
+            else:
+                self._psoas_mask = np.zeros_like(sma_mask)
+        return self._psoas_mask
+
     def segment_imat(self) -> np.ndarray:
         """Segment Intermuscular Adipose Tissue (-190 to -30 HU).
-        
+
         CRITICAL: Uses connectivity-based separation from MuscleCompartmentGenerator.
         Only fat that is NOT connected to the body outline is IMAT.
-        
+
         Returns:
             Binary mask of IMAT pixels
         """
@@ -1023,15 +1076,16 @@ class TissueSegmenter:
     
     def get_all_masks(self) -> Dict[str, np.ndarray]:
         """Get all tissue masks as a dictionary.
-        
+
         Returns:
-            Dictionary with keys 'nama', 'lama', 'imat', 'sma', 'sat'
+            Dictionary with keys 'nama', 'lama', 'imat', 'sma', 'psoas', 'sat'
         """
         return {
             'nama': self.segment_nama(),
             'lama': self.segment_lama(),
             'imat': self.segment_imat(),
             'sma': self.segment_sma(),
+            'psoas': self.segment_psoas(),
             'sat': self.segment_sat()
         }
 
@@ -1074,17 +1128,19 @@ class AreaCalculator:
         lama_area = np.sum(self.masks['lama']) * self.pixel_area_cm2
         imat_area = np.sum(self.masks['imat']) * self.pixel_area_cm2
         sma_area = np.sum(self.masks['sma']) * self.pixel_area_cm2
+        psoas_area = np.sum(self.masks.get('psoas', np.zeros_like(self.masks['sma']))) * self.pixel_area_cm2
         sat_area = np.sum(self.masks.get('sat', np.zeros_like(self.masks['sma']))) * self.pixel_area_cm2
-        
+
         # TAMA is typically synonymous with SMA at L3 level
         tama_area = sma_area
-        
+
         return TissueAreas(
             nama=nama_area,
             lama=lama_area,
             imat=imat_area,
             sma=sma_area,
             tama=tama_area,
+            psoas=psoas_area,
             sat=sat_area
         )
     
@@ -1183,39 +1239,25 @@ class Visualizer:
         # Create 3-channel RGB from grayscale
         rgb = np.stack([windowed] * 3, axis=-1)
         
-        # Apply tissue colors with alpha blending
-        if alpha < 1.0:
-            # Blend with original grayscale
-            if 'nama' in self.masks:
-                rgb[self.masks['nama']] = (
-                    alpha * np.array(self.colors.nama) + 
-                    (1 - alpha) * rgb[self.masks['nama']]
-                )
-            if 'lama' in self.masks:
-                rgb[self.masks['lama']] = (
-                    alpha * np.array(self.colors.lama) + 
-                    (1 - alpha) * rgb[self.masks['lama']]
-                )
-            if 'imat' in self.masks:
-                rgb[self.masks['imat']] = (
-                    alpha * np.array(self.colors.imat) + 
-                    (1 - alpha) * rgb[self.masks['imat']]
-                )
-            if show_sat and 'sat' in self.masks:
-                rgb[self.masks['sat']] = (
-                    alpha * np.array(self.colors.sat) + 
-                    (1 - alpha) * rgb[self.masks['sat']]
-                )
-        else:
-            # Full opacity
-            if 'nama' in self.masks:
-                rgb[self.masks['nama']] = self.colors.nama
-            if 'lama' in self.masks:
-                rgb[self.masks['lama']] = self.colors.lama
-            if 'imat' in self.masks:
-                rgb[self.masks['imat']] = self.colors.imat
-            if show_sat and 'sat' in self.masks:
-                rgb[self.masks['sat']] = self.colors.sat
+        # Apply tissue colors with alpha blending.
+        # Psoas is rendered LAST so it appears on top of NAMA/LAMA
+        # (psoas pixels are a subset of SMA, so they overlap).
+        tissue_layers = [('nama', self.colors.nama, True),
+                         ('lama', self.colors.lama, True),
+                         ('imat', self.colors.imat, True),
+                         ('sat', self.colors.sat, show_sat),
+                         ('psoas', self.colors.psoas, True)]
+
+        for key, color, show in tissue_layers:
+            if not show or key not in self.masks:
+                continue
+            mask = self.masks[key]
+            if not np.any(mask):
+                continue
+            if alpha < 1.0:
+                rgb[mask] = alpha * np.array(color) + (1 - alpha) * rgb[mask]
+            else:
+                rgb[mask] = color
 
         # Enforce body mask: force all non-body pixels to black
         if self.body_mask is not None:
@@ -1457,6 +1499,7 @@ class L3Analyzer:
             'IMAT_cm2': self._areas.imat,
             'SMA_cm2': self._areas.sma,
             'TAMA_cm2': self._areas.tama,
+            'Psoas_cm2': self._areas.psoas,
             'SAT_cm2': self._areas.sat,
             'SMA_BMI': self._ratios.sma_bmi,
             'NAMA_BMI': self._ratios.nama_bmi,

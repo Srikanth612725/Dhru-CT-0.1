@@ -389,6 +389,15 @@ def render_results(results: dict, params: dict):
             help="Total Skeletal Muscle Area"
         )
 
+    # Second row: Psoas
+    col5, col6, col7, col8 = st.columns(4)
+    with col5:
+        st.metric(
+            "🟢 Psoas",
+            f"{areas.psoas:.2f}",
+            help="Psoas Muscle Area (included in SMA)"
+        )
+
     st.divider()
 
     # Clinical ratios section
@@ -450,6 +459,7 @@ def render_visualization(analyzer: L3Analyzer, params: dict):
         st.markdown("🔴 **NAMA** - Normal Attenuation Muscle")
         st.markdown("🔵 **LAMA** - Low Attenuation Muscle")
         st.markdown("🟡 **IMAT** - Intermuscular Fat")
+        st.markdown("🟢 **Psoas** - Psoas Muscles")
 
         st.divider()
 
@@ -494,7 +504,8 @@ def render_export(analyzer: L3Analyzer, results: dict):
         legend_elements = [
             Patch(facecolor='red', label='NAMA (Normal Muscle)'),
             Patch(facecolor='cyan', label='LAMA (Low Attenuation)'),
-            Patch(facecolor='yellow', label='IMAT (Fat)')
+            Patch(facecolor='yellow', label='IMAT (Fat)'),
+            Patch(facecolor='lime', label='Psoas Muscles')
         ]
         ax.legend(handles=legend_elements, loc='upper right')
 
@@ -831,6 +842,7 @@ def render_slice_browser(vol_analyzer: VolumetricAnalyzer, params: dict):
             st.metric("NAMA", f"{l3a.nama:.2f}")
             st.metric("LAMA", f"{l3a.lama:.2f}")
             st.metric("IMAT", f"{l3a.imat:.2f}")
+            st.metric("Psoas", f"{l3a.psoas:.2f}")
             st.metric("SMA", f"{l3a.sma:.2f}")
             nt = l3a.nama / l3a.sma if l3a.sma > 0 else 0
             nt_status = "🟢" if nt > 0.66 else "🟡" if nt > 0.50 else "🔴"
@@ -840,6 +852,7 @@ def render_slice_browser(vol_analyzer: VolumetricAnalyzer, params: dict):
             st.metric("NAMA", f"{sr.areas.nama:.2f}")
             st.metric("LAMA", f"{sr.areas.lama:.2f}")
             st.metric("IMAT", f"{sr.areas.imat:.2f}")
+            st.metric("Psoas", f"{sr.areas.psoas:.2f}")
             st.metric("SMA", f"{sr.areas.sma:.2f}")
 
         st.divider()
@@ -847,6 +860,7 @@ def render_slice_browser(vol_analyzer: VolumetricAnalyzer, params: dict):
         st.markdown("🔴 **NAMA** - Normal Muscle")
         st.markdown("🔵 **LAMA** - Low Attenuation Muscle")
         st.markdown("🟡 **IMAT** - Intermuscular Fat")
+        st.markdown("🟢 **Psoas** - Psoas Muscles")
 
 
 def render_per_slice_chart(vol_analyzer: VolumetricAnalyzer):

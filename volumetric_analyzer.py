@@ -43,6 +43,7 @@ class TissueVolumes:
     imat: float
     sma: float
     tama: float
+    psoas: float = 0.0
     sat: float = 0.0
 
 
@@ -282,6 +283,7 @@ class VolumetricAnalyzer:
             imat=sum(s.areas.imat for s in self.slice_results) * slice_thickness_cm,
             sma=sum(s.areas.sma for s in self.slice_results) * slice_thickness_cm,
             tama=sum(s.areas.tama for s in self.slice_results) * slice_thickness_cm,
+            psoas=sum(s.areas.psoas for s in self.slice_results) * slice_thickness_cm,
             sat=sum(s.areas.sat for s in self.slice_results) * slice_thickness_cm,
         )
 
@@ -405,6 +407,7 @@ class VolumetricAnalyzer:
             'IMAT_cm3': self._volumes.imat,
             'SMA_cm3': self._volumes.sma,
             'TAMA_cm3': self._volumes.tama,
+            'Psoas_cm3': self._volumes.psoas,
             'SAT_cm3': self._volumes.sat,
             'SMV_BMI': self._ratios.smv_bmi,
             'NAMA_vol_BMI': self._ratios.nama_vol_bmi,
@@ -419,6 +422,7 @@ class VolumetricAnalyzer:
             d['L3_NAMA_cm2'] = a.nama
             d['L3_LAMA_cm2'] = a.lama
             d['L3_IMAT_cm2'] = a.imat
+            d['L3_Psoas_cm2'] = a.psoas
             d['L3_SMA_cm2'] = a.sma
             d['L3_NAMA_TAMA'] = a.nama / a.sma if a.sma > 0 else 0
         return d
@@ -434,6 +438,7 @@ class VolumetricAnalyzer:
                 'NAMA_cm2': sr.areas.nama,
                 'LAMA_cm2': sr.areas.lama,
                 'IMAT_cm2': sr.areas.imat,
+                'Psoas_cm2': sr.areas.psoas,
                 'SMA_cm2': sr.areas.sma,
                 'SAT_cm2': sr.areas.sat,
             })
