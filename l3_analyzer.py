@@ -652,19 +652,30 @@ class MuscleCompartmentGenerator:
                 vert_height = vert_bbox[2] - vert_bbox[0]
                 vert_width = vert_bbox[3] - vert_bbox[1]
 
-                # Define a generous SEARCH region around the vertebra
-                # (we'll use CCA within this region, not treat it all as psoas)
-                search_radius = max(vert_height, vert_width) * 2
+                # PROXIMITY-BASED PSOAS DETECTION
+                #
+                # Strategy: the psoas is the CLOSEST anterolateral muscle
+                # to the vertebral body (one on each side). Instead of using
+                # a fixed search radius (which fails when the vertebral
+                # bounding box is large due to transverse/spinous processes),
+                # we find ALL muscle blobs in the body, filter by direction,
+                # and pick the nearest qualifying blob on each side.
+
+                # Use a generous search region (fraction of body size) to
+                # find candidate muscle blobs, but the SELECTION is based
+                # on proximity ranking, not the region boundary.
+                body_rows = np.any(self.body_mask, axis=1)
+                body_cols = np.any(self.body_mask, axis=0)
+                body_h = np.sum(body_rows)
+                body_w = np.sum(body_cols)
+                search_radius = min(body_h, body_w) * 0.25
+
                 rr_full = np.arange(self.hu_image.shape[0])[:, np.newaxis]
                 cc_full = np.arange(self.hu_image.shape[1])[np.newaxis, :]
                 search_region = (
                     ((rr_full - vert_centroid_r) ** 2 +
                      (cc_full - vert_centroid_c) ** 2) <= search_radius ** 2
-                ) & self.body_mask
-
-                # Exclude the peripheral muscle band (those are abdominal wall
-                # muscles, not psoas) and bone and SAT
-                search_region = search_region & ~muscle_band & ~bone_mask & ~subcutaneous_mask
+                ) & self.body_mask & ~bone_mask & ~subcutaneous_mask
 
                 # Find muscle-density tissue in the search region
                 muscle_near_vertebra = (
@@ -677,33 +688,45 @@ class MuscleCompartmentGenerator:
                 # the psoas from erector spinae and other muscles
                 labeled_muscle = measure.label(muscle_near_vertebra)
 
-                # Classify each component: is it psoas?
-                # Psoas criteria:
-                #   1. Center is ANTEROLATERAL to vertebral centroid
-                #      (anterior = lower row index; lateral = away from midline)
-                #   2. Size is plausible for psoas (3-20 cm² per side at L3)
-                #      In pixels: roughly 200-4000 px (depends on resolution)
-                min_psoas_px = 100   # ~1.5 cm² minimum
+                # Collect candidate blobs that could be psoas
+                min_psoas_px = 80    # ~1 cm² minimum
                 max_psoas_px = 5000  # ~25 cm² maximum per side
+
+                left_candidates = []   # left of vertebra (lower column)
+                right_candidates = []  # right of vertebra (higher column)
 
                 for region in measure.regionprops(labeled_muscle):
                     if region.area < min_psoas_px or region.area > max_psoas_px:
                         continue
 
                     blob_r, blob_c = region.centroid
+                    dist = np.sqrt(
+                        (blob_r - vert_centroid_r) ** 2 +
+                        (blob_c - vert_centroid_c) ** 2
+                    )
 
-                    # Must be anterior to vertebral centroid (or at same level)
-                    # Allow slight posterior margin for psoas wrapping
+                    # Must NOT be posterior to vertebral centroid
+                    # (posterior = higher row in standard CT axial orientation)
                     if blob_r > vert_centroid_r + vert_height * 0.3:
-                        continue  # Too posterior — likely erector spinae
+                        continue  # Too posterior — erector spinae / multifidus
 
-                    # Must be lateral to vertebral body (not directly on midline)
+                    # Must be lateral — not directly on the midline
                     lateral_dist = abs(blob_c - vert_centroid_c)
-                    if lateral_dist < vert_width * 0.3:
-                        continue  # Too close to midline — likely not psoas
+                    if lateral_dist < vert_width * 0.2:
+                        continue  # On midline — likely part of vertebral canal
 
-                    # This blob passes all criteria — it's psoas
-                    psoas_zone |= (labeled_muscle == region.label)
+                    # Classify by side and store with distance
+                    if blob_c < vert_centroid_c:
+                        left_candidates.append((dist, region.label))
+                    else:
+                        right_candidates.append((dist, region.label))
+
+                # Pick the CLOSEST qualifying blob on each side — that's psoas
+                for candidates in [left_candidates, right_candidates]:
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0])
+                        best_label = candidates[0][1]
+                        psoas_zone |= (labeled_muscle == best_label)
 
         # Step 6: Combined muscle compartment = peripheral band + psoas zone
         combined_valid_zone = muscle_band | psoas_zone
