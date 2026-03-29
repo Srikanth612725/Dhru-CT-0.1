@@ -550,20 +550,24 @@ class MuscleCompartmentGenerator:
     
     def _generate_connectivity_based(self, boundary_dilation: int = 5,
                                       sat_fraction: float = 0.08,
-                                      muscle_fraction: float = 0.12) -> np.ndarray:
+                                      muscle_fraction: float = 0.15) -> np.ndarray:
         """
         CONNECTIVITY-BASED approach to separate tissues into compartments.
 
         Produces three compartments:
         - Subcutaneous fat (SAT): fat connected to the body outline
-        - Muscle compartment: peripheral muscle band + psoas zone near vertebra
+        - Muscle compartment: peripheral band + DEEP POSTERIOR ZONE around vertebra
         - Visceral cavity: organs and visceral fat in the center (EXCLUDED)
 
-        Strategy:
-        1. Identify body outline and classify fat as SAT vs interior fat
-        2. Define peripheral muscle band (abdominal wall muscles)
-        3. Detect vertebral body and add psoas zone around it
-        4. IMAT = only SMALL fat pockets within the muscle compartment
+        KEY DESIGN (validated against CoreSlicer for 4 patients):
+        The muscle compartment has TWO parts:
+        1. Peripheral band: captures abdominal wall muscles (rectus, obliques, transversus)
+        2. Deep posterior zone: large elliptical region centered on the vertebral body,
+           captures ALL deep posterior muscles (erector spinae, QL, psoas)
+        These two zones OVERLAP and MERGE to form the complete muscle ring.
+
+        Within this compartment, NAMA-seeded region growing (in segment_sma)
+        naturally limits SMA to actual muscle tissue.
 
         Clinical Reference:
             Shen W et al. Am J Clin Nutr 2004
@@ -613,7 +617,7 @@ class MuscleCompartmentGenerator:
         body_minor = min(body_height, body_width)
 
         sat_depth = max(15, int(body_minor * sat_fraction))
-        muscle_depth = max(20, int(body_minor * muscle_fraction))
+        muscle_depth = max(25, int(body_minor * muscle_fraction))
         muscle_end = sat_depth + muscle_depth
 
         # Geometric SAT zone
@@ -626,22 +630,25 @@ class MuscleCompartmentGenerator:
             (dist_from_boundary <= muscle_end)
         )
 
-        # Step 5: Detect psoas muscles using CONNECTED COMPONENT ANALYSIS
+        # Step 5: Detect vertebral body and create DEEP POSTERIOR ZONE
         #
-        # At L3, the psoas is naturally separated from other muscles by:
-        #   - The transverse process (bone barrier)
-        #   - Fascial fat planes between muscle compartments
+        # At L3, the deep posterior muscles (erector spinae, quadratus
+        # lumborum, psoas) form a thick mass around the vertebral body.
+        # These muscles extend from the transverse processes posteriorly
+        # to the vertebral body anterolaterally.
         #
-        # Strategy: find muscle-density blobs near the vertebra. Fat and
-        # bone naturally break up muscle into disconnected components.
-        # The blob(s) ANTEROLATERAL to the vertebra = psoas.
+        # A peripheral band alone CANNOT capture these because they
+        # are too deep (7-10cm from skin to vertebral body posteriorly).
         #
-        # This uses ACTUAL tissue boundaries instead of arbitrary
-        # geometric ellipses, matching clinical manual segmentation.
+        # Solution: create a large elliptical zone centered on the
+        # vertebral body. This zone OVERLAPS with the peripheral band,
+        # so the two together capture the COMPLETE muscle ring.
         bone_mask = (self.hu_image > 200) & self.body_mask
         bone_mask = morphology.remove_small_objects(bone_mask, max_size=100)
 
         psoas_zone = np.zeros_like(self.body_mask)
+        deep_posterior_zone = np.zeros_like(self.body_mask)
+
         if np.any(bone_mask):
             labeled_bone = measure.label(bone_mask)
             bone_regions = measure.regionprops(labeled_bone)
@@ -652,84 +659,82 @@ class MuscleCompartmentGenerator:
                 vert_height = vert_bbox[2] - vert_bbox[0]
                 vert_width = vert_bbox[3] - vert_bbox[1]
 
-                # PROXIMITY-BASED PSOAS DETECTION
+                # ------------------------------------------------
+                # DEEP POSTERIOR ZONE: large ellipse around vertebra
+                # ------------------------------------------------
+                # This captures erector spinae, quadratus lumborum, and
+                # psoas — the entire deep muscle group.
                 #
-                # Strategy: the psoas is the CLOSEST anterolateral muscle
-                # to the vertebral body (one on each side). Instead of using
-                # a fixed search radius (which fails when the vertebral
-                # bounding box is large due to transverse/spinous processes),
-                # we find ALL muscle blobs in the body, filter by direction,
-                # and pick the nearest qualifying blob on each side.
+                # Dimensions based on anatomy at L3:
+                # - Posterior: extend well beyond vertebra (erector spinae)
+                # - Lateral: extend ~3x vertebral width (QL + psoas)
+                # - Anterior: limited extent (avoid visceral cavity)
+                #
+                # Image coords: high row = posterior, low row = anterior
+                rr = np.arange(self.hu_image.shape[0])[:, np.newaxis]
+                cc = np.arange(self.hu_image.shape[1])[np.newaxis, :]
 
-                # Use a generous search region (fraction of body size) to
-                # find candidate muscle blobs, but the SELECTION is based
-                # on proximity ranking, not the region boundary.
-                body_rows = np.any(self.body_mask, axis=1)
-                body_cols = np.any(self.body_mask, axis=0)
-                body_h = np.sum(body_rows)
-                body_w = np.sum(body_cols)
-                search_radius = min(body_h, body_w) * 0.25
+                # Ellipse radii (generous to capture full muscle group)
+                # Posterior direction: extend to body boundary
+                # Lateral: ~3x vertebral width
+                # Anterior: ~2x vertebral height (limited to avoid visceral)
+                r_posterior = body_minor * 0.35  # generous posterior extent
+                r_anterior = max(vert_height * 2.0, body_minor * 0.10)
+                r_lateral = max(vert_width * 3.0, body_minor * 0.18)
 
-                rr_full = np.arange(self.hu_image.shape[0])[:, np.newaxis]
-                cc_full = np.arange(self.hu_image.shape[1])[np.newaxis, :]
-                search_region = (
-                    ((rr_full - vert_centroid_r) ** 2 +
-                     (cc_full - vert_centroid_c) ** 2) <= search_radius ** 2
-                ) & self.body_mask & ~bone_mask & ~subcutaneous_mask
+                # Asymmetric ellipse: different anterior vs posterior radius
+                # delta_r > 0 means more posterior (higher row)
+                delta_r = rr - vert_centroid_r
+                delta_c = cc - vert_centroid_c
 
-                # Find muscle-density tissue in the search region
-                muscle_near_vertebra = (
-                    (self.hu_image >= self.thresholds.sma_min) &
-                    (self.hu_image <= self.thresholds.sma_max) &
-                    search_region
+                # Use anterior radius for delta_r < 0, posterior for delta_r > 0
+                r_vert = np.where(delta_r < 0, r_anterior, r_posterior)
+
+                ellipse_dist = (delta_r / r_vert) ** 2 + (delta_c / r_lateral) ** 2
+                deep_posterior_zone = (
+                    (ellipse_dist <= 1.0) &
+                    self.body_mask &
+                    ~bone_mask &
+                    ~subcutaneous_mask
                 )
 
-                # Connected component analysis — fat/bone naturally separates
-                # the psoas from erector spinae and other muscles
-                labeled_muscle = measure.label(muscle_near_vertebra)
+                # ------------------------------------------------
+                # PSOAS ZONE: anterolateral quadrants of vertebral area
+                # ------------------------------------------------
+                # The psoas sits immediately anterolateral to the vertebral
+                # body. It's the anterior portion of the deep muscle group.
+                #
+                # Psoas zone = tissue that is:
+                #   - Anterior to vertebral centroid (lower row)
+                #   - Lateral to vertebral body (away from midline)
+                #   - Within a tight distance from the vertebra
+                psoas_r_ant = max(vert_height * 1.5, body_minor * 0.08)
+                psoas_r_lat = max(vert_width * 2.0, body_minor * 0.12)
 
-                # Collect candidate blobs that could be psoas
-                min_psoas_px = 80    # ~1 cm² minimum
-                max_psoas_px = 5000  # ~25 cm² maximum per side
+                psoas_ellipse = (
+                    (delta_r / psoas_r_ant) ** 2 +
+                    (delta_c / psoas_r_lat) ** 2
+                ) <= 1.0
 
-                left_candidates = []   # left of vertebra (lower column)
-                right_candidates = []  # right of vertebra (higher column)
+                # Must be anterior (lower row) or at same level as vertebra
+                anterior_mask = delta_r <= vert_height * 0.3
 
-                for region in measure.regionprops(labeled_muscle):
-                    if region.area < min_psoas_px or region.area > max_psoas_px:
-                        continue
+                # Must be lateral (not on midline)
+                lateral_mask = np.abs(delta_c) > vert_width * 0.3
 
-                    blob_r, blob_c = region.centroid
-                    dist = np.sqrt(
-                        (blob_r - vert_centroid_r) ** 2 +
-                        (blob_c - vert_centroid_c) ** 2
-                    )
+                psoas_zone = (
+                    psoas_ellipse &
+                    anterior_mask &
+                    lateral_mask &
+                    self.body_mask &
+                    ~bone_mask &
+                    ~subcutaneous_mask
+                )
 
-                    # Must NOT be posterior to vertebral centroid
-                    # (posterior = higher row in standard CT axial orientation)
-                    if blob_r > vert_centroid_r + vert_height * 0.3:
-                        continue  # Too posterior — erector spinae / multifidus
-
-                    # Must be lateral — not directly on the midline
-                    lateral_dist = abs(blob_c - vert_centroid_c)
-                    if lateral_dist < vert_width * 0.2:
-                        continue  # On midline — likely part of vertebral canal
-
-                    # Classify by side and store with distance
-                    if blob_c < vert_centroid_c:
-                        left_candidates.append((dist, region.label))
-                    else:
-                        right_candidates.append((dist, region.label))
-
-                # Pick the CLOSEST qualifying blob on each side — that's psoas
-                for candidates in [left_candidates, right_candidates]:
-                    if candidates:
-                        candidates.sort(key=lambda x: x[0])
-                        best_label = candidates[0][1]
-                        psoas_zone |= (labeled_muscle == best_label)
-
-        # Step 6: Combined muscle compartment = peripheral band + psoas zone
-        combined_valid_zone = muscle_band | psoas_zone
+        # Step 6: Combined muscle compartment
+        # = peripheral band (abdominal wall) + deep posterior zone
+        # The overlap between these two creates a seamless muscle ring.
+        combined_valid_zone = muscle_band | deep_posterior_zone
 
         # Only include muscle-density tissue in the compartment
         muscle_tissue = (
@@ -739,7 +744,7 @@ class MuscleCompartmentGenerator:
         )
         bone_tissue = (
             (self.hu_image > self.thresholds.bone_threshold) &
-            muscle_band  # bone only in peripheral band, not psoas zone
+            combined_valid_zone
         )
 
         structural = muscle_tissue | bone_tissue
