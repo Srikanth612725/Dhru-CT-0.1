@@ -552,34 +552,33 @@ class MuscleCompartmentGenerator:
                                       sat_fraction: float = 0.08,
                                       muscle_fraction: float = 0.15) -> np.ndarray:
         """
-        CONNECTIVITY-BASED muscle compartment detection.
+        ADAPTIVE-DEPTH muscle compartment detection for L3.
 
-        Core principle: at L3, skeletal muscle forms a continuous RING
-        (abdominal wall + posterior muscles) that separates subcutaneous
-        fat from visceral contents. Organs inside the ring are isolated
-        from the ring by peritoneal/mesenteric fat.
+        At L3, skeletal muscle forms a ring of VARIABLE thickness:
+        - Anterior: thin (rectus abdominis, ~2-3cm)
+        - Lateral: moderate (obliques, ~3-4cm)
+        - Posterior: THICK (erector spinae, QL, psoas, ~6-10cm to vertebra)
 
         Algorithm:
-        1. Find SAT (fat connected to body outline, depth-capped)
-        2. Find all structural tissue (muscle-density + bone) excluding SAT
-        3. Muscle ring = LARGEST connected component of structural tissue
-           (organs in the visceral cavity form smaller, isolated components)
-        4. Also include any component touching the SAT boundary
-        5. Psoas = SMA within a tight zone near the vertebral body
-        6. IMAT = small fat pockets within the muscle ring
+        1. Find SAT (fat connected to body outline)
+        2. Find vertebral body (posterior landmark)
+        3. For each pixel, compute depth limit based on its angular
+           direction from body centroid relative to vertebral body:
+           - Posterior direction: depth extends to the vertebral body
+           - Anterior direction: depth is limited (excludes visceral cavity)
+        4. Muscle compartment = tissue within this adaptive-depth shell
+        5. Psoas = SMA within tight zone near vertebral body
+        6. IMAT = small fat pockets within compartment
 
         Clinical Reference:
-            Shen W et al. Am J Clin Nutr 2004
             Mourtzakis M et al. Appl Physiol Nutr Metab 2008
+            Shen W et al. Am J Clin Nutr 2004
         """
 
         from scipy.ndimage import distance_transform_edt
 
         # ============================================================
-        # STEP 1: Identify SAT (subcutaneous adipose tissue)
-        # SAT = fat connected to the body outline, CAPPED at a max depth
-        # to prevent flooding into the visceral cavity through gaps
-        # in the muscle ring.
+        # STEP 1: Identify SAT
         # ============================================================
         body_outline = self.body_mask & ~morphology.erosion(
             self.body_mask, morphology.disk(3)
@@ -594,15 +593,14 @@ class MuscleCompartmentGenerator:
         body_minor = min(np.sum(body_rows), np.sum(body_cols))
         sat_depth = max(15, int(body_minor * sat_fraction))
 
-        # Maximum depth for SAT — prevents flooding through muscle gaps
-        max_sat_depth = int(body_minor * 0.25)
-
         all_fat = (
             (self.hu_image >= self.thresholds.imat_min) &
             (self.hu_image <= self.thresholds.imat_max) &
             self.body_mask
         )
 
+        # Classify fat as SAT vs interior, capped at max depth
+        max_sat_depth = int(body_minor * 0.25)
         labeled_fat = measure.label(all_fat)
         subcutaneous_mask = np.zeros_like(all_fat)
         interior_fat_mask = np.zeros_like(all_fat)
@@ -611,89 +609,26 @@ class MuscleCompartmentGenerator:
             region_mask = labeled_fat == region.label
             dilated_region = morphology.dilation(region_mask, morphology.disk(3))
             if np.any(dilated_region & near_boundary):
-                subcutaneous_mask |= region_mask
+                # Cap at max depth to prevent flooding through muscle gaps
+                subcutaneous_mask |= (region_mask & (dist_from_boundary <= max_sat_depth))
+                interior_fat_mask |= (region_mask & (dist_from_boundary > max_sat_depth))
             else:
                 interior_fat_mask |= region_mask
 
-        # Cap SAT at max depth — anything deeper is interior fat
-        depth_cap = dist_from_boundary <= max_sat_depth
-        overflow = subcutaneous_mask & ~depth_cap
-        subcutaneous_mask = subcutaneous_mask & depth_cap
-        interior_fat_mask = interior_fat_mask | overflow
-
-        # Also add geometric SAT zone
         geometric_sat = self.body_mask & (dist_from_boundary <= sat_depth)
         subcutaneous_mask = subcutaneous_mask | geometric_sat
 
         # ============================================================
-        # STEP 2: Find the MUSCLE RING
-        #
-        # The muscle ring at L3 is the LARGEST connected mass of
-        # structural tissue (muscle + bone). Visceral organs form
-        # smaller isolated components separated by peritoneal fat.
-        #
-        # Also include any component touching the SAT boundary to
-        # capture muscle groups that may be disconnected from the
-        # main ring due to thin fascial gaps.
-        # ============================================================
-        structural = (
-            (
-                (self.hu_image >= self.thresholds.sma_min) &
-                (self.hu_image <= self.thresholds.sma_max)
-            ) | (
-                self.hu_image > 200  # bone
-            )
-        ) & self.body_mask & ~subcutaneous_mask
-
-        # Light dilation to bridge tiny fascial gaps between muscles
-        # (1px = ~1mm, bridges fascial septa but not peritoneal space)
-        bridged = morphology.dilation(structural, morphology.disk(1))
-        labeled_bridged = measure.label(bridged)
-
-        # Find the largest component (= the muscle ring)
-        regions = measure.regionprops(labeled_bridged)
-        muscle_ring = np.zeros_like(self.body_mask)
-
-        if regions:
-            largest = max(regions, key=lambda r: r.area)
-            # Start with the largest component
-            muscle_ring = (labeled_bridged == largest.label)
-
-            # Also include components touching SAT border (catches
-            # any abdominal wall muscles disconnected from the main ring)
-            sat_border = (
-                morphology.dilation(subcutaneous_mask, morphology.disk(2)) &
-                ~subcutaneous_mask & self.body_mask
-            )
-            for region in regions:
-                if region.label == largest.label:
-                    continue
-                region_mask = labeled_bridged == region.label
-                if np.any(region_mask & sat_border):
-                    muscle_ring |= region_mask
-
-        # Map back to actual structural pixels (remove dilation artifacts)
-        muscle_ring = structural & muscle_ring
-
-        # Dilate the ring slightly to include IMAT pockets between muscles
-        muscle_compartment = morphology.dilation(
-            muscle_ring, morphology.disk(2)
-        )
-        muscle_compartment = (
-            muscle_compartment & self.body_mask & ~subcutaneous_mask
-        )
-
-        # ============================================================
-        # STEP 3: Detect vertebral body for PSOAS zone
-        #
-        # Psoas = compact muscle immediately anterolateral to the
-        # vertebral body. Zone is kept TIGHT:
-        #   CoreSlicer reference: 5-11 cm² per side, 12-20 cm² bilateral
+        # STEP 2: Find vertebral body (posterior landmark)
         # ============================================================
         bone_mask = (self.hu_image > 200) & self.body_mask
         bone_mask = morphology.remove_small_objects(bone_mask, max_size=100)
 
-        psoas_zone = np.zeros_like(self.body_mask)
+        vert_centroid_r = None
+        vert_centroid_c = None
+        vert_height = 0
+        vert_width = 0
+
         if np.any(bone_mask):
             labeled_bone = measure.label(bone_mask)
             bone_regions = measure.regionprops(labeled_bone)
@@ -704,51 +639,126 @@ class MuscleCompartmentGenerator:
                 vert_height = vert_bbox[2] - vert_bbox[0]
                 vert_width = vert_bbox[3] - vert_bbox[1]
 
-                rr = np.arange(self.hu_image.shape[0])[:, np.newaxis]
-                cc = np.arange(self.hu_image.shape[1])[np.newaxis, :]
+        # ============================================================
+        # STEP 3: ADAPTIVE-DEPTH muscle compartment
+        #
+        # The depth of the muscle shell varies around the body:
+        # - In the direction TOWARD the vertebral body: depth extends
+        #   all the way to the vertebral body (deep posterior muscles)
+        # - In the OPPOSITE direction (anterior): limited depth
+        #   (just the abdominal wall, excludes visceral cavity)
+        # - Smooth transition between these extremes
+        # ============================================================
 
-                # Psoas zone: compact ellipses flanking the vertebra
-                # The psoas sits ANTERIOR to the transverse processes
-                # and LATERAL to the vertebral body.
-                #
-                # Center: slightly anterior, at vertebral body lateral edge
-                psoas_offset_ant = vert_height * 0.4
-                psoas_offset_lat = vert_width * 0.7
+        # Body centroid
+        body_r_indices, body_c_indices = np.where(self.body_mask)
+        body_centroid_r = np.mean(body_r_indices)
+        body_centroid_c = np.mean(body_c_indices)
 
-                # Tight semi-axes (psoas is ~2-3cm AP × 3-4cm ML)
-                semi_r = vert_height * 0.6
-                semi_c = vert_width * 0.5
+        rr = np.arange(self.hu_image.shape[0])[:, np.newaxis].astype(float)
+        cc = np.arange(self.hu_image.shape[1])[np.newaxis, :].astype(float)
 
-                for side in [-1, +1]:
-                    center_r = vert_centroid_r - psoas_offset_ant
-                    center_c = vert_centroid_c + side * psoas_offset_lat
+        # Base muscle depth for anterior/lateral (thin abdominal wall)
+        # Rectus ~1-2cm, obliques ~2-3cm → keep this SMALL
+        base_depth = max(20, int(body_minor * 0.08))
 
-                    dist = (
-                        ((rr - center_r) / semi_r) ** 2 +
-                        ((cc - center_c) / semi_c) ** 2
-                    )
-                    ellipse = dist <= 1.0
+        if vert_centroid_r is not None:
+            # Angle from body centroid to each pixel
+            angle_to_pixel = np.arctan2(
+                rr - body_centroid_r, cc - body_centroid_c
+            )
+            # Angle from body centroid to vertebral body
+            vert_angle = np.arctan2(
+                vert_centroid_r - body_centroid_r,
+                vert_centroid_c - body_centroid_c
+            )
 
-                    # Restrict: must be anterior to vertebral centroid
-                    # (excludes erector spinae which is posterior)
-                    anterior = rr <= vert_centroid_r + vert_height * 0.15
+            # Angular distance from vertebral direction [0, π]
+            angle_diff = np.abs(angle_to_pixel - vert_angle)
+            angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
 
-                    psoas_zone |= (ellipse & anterior)
+            # Posterior factor: 1.0 toward vertebra, 0.0 away from it
+            # cosine-squared gives smooth transition
+            posterior_factor = np.cos(angle_diff / 2) ** 2
 
-                psoas_zone = (
-                    psoas_zone &
-                    self.body_mask &
-                    ~bone_mask &
-                    ~subcutaneous_mask
-                )
+            # Maximum posterior depth = distance from body boundary to
+            # PAST the vertebral body (captures erector spinae + psoas)
+            vert_depth = dist_from_boundary[
+                int(vert_centroid_r), int(vert_centroid_c)
+            ]
+            # Extend 1x vertebral height past vertebra for psoas
+            deep_depth = vert_depth + vert_height * 1.0
+
+            # Adaptive muscle depth at each pixel
+            anterior_end = sat_depth + base_depth
+            local_muscle_end = (
+                anterior_end +
+                (deep_depth - anterior_end) * posterior_factor
+            )
+            # Ensure deep_depth is always >= anterior_end
+            local_muscle_end = np.maximum(local_muscle_end, anterior_end)
+        else:
+            # No vertebra found — use fixed depth everywhere
+            local_muscle_end = sat_depth + base_depth
+
+        # Muscle compartment = tissue within the adaptive shell
+        muscle_band = self.body_mask & (
+            (dist_from_boundary > sat_depth) &
+            (dist_from_boundary <= local_muscle_end)
+        )
+
+        # Only keep structural tissue (muscle-HU + bone) in the compartment
+        structural = (
+            (
+                (self.hu_image >= self.thresholds.sma_min) &
+                (self.hu_image <= self.thresholds.sma_max)
+            ) | (
+                self.hu_image > self.thresholds.bone_threshold
+            )
+        ) & muscle_band
+
+        # Dilate slightly to include IMAT pockets between muscles
+        muscle_compartment = morphology.dilation(structural, morphology.disk(2))
+        muscle_compartment = muscle_compartment & muscle_band
 
         # ============================================================
-        # STEP 4: IMAT = small fat pockets WITHIN the muscle ring
+        # STEP 4: Psoas zone — tight, near vertebral body
+        # ============================================================
+        psoas_zone = np.zeros_like(self.body_mask)
+        if vert_centroid_r is not None:
+            # Psoas zone: compact ellipses flanking the vertebra
+            psoas_offset_ant = vert_height * 0.4
+            psoas_offset_lat = vert_width * 0.7
+
+            semi_r = vert_height * 0.6
+            semi_c = vert_width * 0.5
+
+            for side in [-1, +1]:
+                center_r = vert_centroid_r - psoas_offset_ant
+                center_c = vert_centroid_c + side * psoas_offset_lat
+
+                dist = (
+                    ((rr - center_r) / semi_r) ** 2 +
+                    ((cc - center_c) / semi_c) ** 2
+                )
+                ellipse = dist <= 1.0
+                anterior = rr <= vert_centroid_r + vert_height * 0.15
+                psoas_zone |= (ellipse & anterior)
+
+            psoas_zone = (
+                psoas_zone &
+                self.body_mask &
+                ~bone_mask &
+                ~subcutaneous_mask
+            )
+
+        # ============================================================
+        # STEP 5: IMAT = small fat pockets within muscle compartment
         # ============================================================
         imat_mask = np.zeros_like(all_fat)
-        interior_in_ring = interior_fat_mask & muscle_compartment
+        interior_in_comp = interior_fat_mask & muscle_compartment
 
-        labeled_interior = measure.label(interior_in_ring)
+        labeled_interior = measure.label(interior_in_comp)
         max_imat_size = 2000
         for region in measure.regionprops(labeled_interior):
             if region.area <= max_imat_size:
